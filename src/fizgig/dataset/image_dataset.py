@@ -432,6 +432,72 @@ class BucketBatchManager:
         else:
             stacked["timesteps"] = None
 
+        # --- Perceptual sidecar data ---
+        # Depth GT: lazy-loaded from _face_id_cache/*.safetensors per image.
+        # Subject mask: lazy-loaded from the same sidecar under a different key.
+        # Identity / landmark / body-proportion embeddings are small and stored
+        # in-memory on ItemInfo after the perceptual cache pass in the trainer.
+        _depth_tensors: list = []
+        _mask_tensors: list = []
+        _identity_tensors: list = []
+        _face_bbox_tensors: list = []
+        _landmark_tensors: list = []
+        _body_prop_tensors: list = []
+
+        for item_info in bucket[start:end]:
+            # Depth GT
+            if getattr(item_info, 'is_depth_cached', False):
+                try:
+                    from safetensors.torch import load_file as _sf_load
+                    _d = _sf_load(item_info._depth_cache_path)
+                    _key = item_info._depth_cache_key
+                    if _key in _d:
+                        _depth_tensors.append(_d[_key])
+                except Exception:
+                    pass
+
+            # Subject mask (stored alongside depth in the same sidecar)
+            if getattr(item_info, 'is_mask_cached', False):
+                try:
+                    from safetensors.torch import load_file as _sf_load2
+                    _m = _sf_load2(item_info._mask_cache_path)
+                    if 'subject_mask' in _m:
+                        _mask_tensors.append(_m['subject_mask'])
+                except Exception:
+                    pass
+
+            # In-memory perceptual embeddings
+            _ie = getattr(item_info, 'identity_embedding', None)
+            if _ie is not None:
+                _identity_tensors.append(_ie)
+
+            _fb = getattr(item_info, 'face_bbox', None)
+            if _fb is not None:
+                _face_bbox_tensors.append(_fb)
+
+            _le = getattr(item_info, 'landmark_embedding', None)
+            if _le is not None:
+                _landmark_tensors.append(_le)
+
+            _bp = getattr(item_info, 'body_proportion_embedding', None)
+            if _bp is not None:
+                _body_prop_tensors.append(_bp)
+
+        def _stack_if_full(tensors, batch_len, key):
+            if len(tensors) == batch_len:
+                try:
+                    stacked[key] = torch.stack(tensors)
+                except Exception:
+                    pass  # shape mismatch — skip silently
+
+        _blen = end - start
+        _stack_if_full(_depth_tensors, _blen, 'depth_gt')
+        _stack_if_full(_mask_tensors, _blen, 'subject_mask')
+        _stack_if_full(_identity_tensors, _blen, 'identity_embedding')
+        _stack_if_full(_face_bbox_tensors, _blen, 'face_bbox')
+        _stack_if_full(_landmark_tensors, _blen, 'landmark_embedding')
+        _stack_if_full(_body_prop_tensors, _blen, 'body_proportion_embedding')
+
         return stacked
 
 
