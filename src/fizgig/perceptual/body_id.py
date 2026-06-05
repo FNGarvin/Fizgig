@@ -1,3 +1,12 @@
+# This file contains code derived from the ai-toolkit-perceptual project,
+# used under the terms of the MIT License.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
 import os
 from typing import Optional, List, TYPE_CHECKING
 
