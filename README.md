@@ -86,6 +86,45 @@ Beside it sits a **live sample override** — tick it to set a prompt, seed, wid
 ### Compatibility
 Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / LoHa) — all auto-converted on load. LyCORIS files work for preview, profiling, and extraction; **bake** materialises them to a standard LoRA via GPU-accelerated SVD. Output is kohya-style `.safetensors` that drop straight into ComfyUI Klein nodes. Every tab links to the relevant section of the walkthrough video.
 
+### Headless training
+
+Use the GUI for dataset curation — captioning, face crops, review — then train headlessly on a remote machine (no display required).
+
+**Step 1 — Save a config from the GUI**
+
+Set up your training run as normal. Click **Save Config** (next to Start Training) and choose a path. This writes a `.toml` file capturing every current setting.
+
+**Step 2 — Copy dataset and config to the remote machine**
+
+The saved config contains absolute paths as they exist on your local machine. Update `dataset_config`, `dit`, `vae`, `text_encoder`, `output_dir`, and any other path fields to match the remote filesystem before running.
+
+**Step 3 — Cache latents and text encodings**
+
+```bash
+python src/fizgig/scripts/cache_latents.py \
+    --dataset_config /path/to/Fizgig_train.toml \
+    --vae /path/to/vae.safetensors
+
+python src/fizgig/scripts/cache_text.py \
+    --dataset_config /path/to/Fizgig_train.toml \
+    --text_encoder /path/to/text_encoder
+```
+
+**Step 4 — Run training**
+
+```bash
+accelerate launch src/fizgig/scripts/train.py \
+    --config_file /path/to/train_config.toml
+```
+
+Any setting in the config file can be overridden at the command line. For example, to bump the learning rate without editing the file:
+
+```bash
+accelerate launch src/fizgig/scripts/train.py \
+    --config_file /path/to/train_config.toml \
+    --learning_rate 5e-4
+```
+
 ---
 
 ## Requirements

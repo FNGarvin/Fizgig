@@ -2788,6 +2788,8 @@ class LoRATrainerGUI:
         self._start_training_btn = ttk.Button(button_frame, text="Start Training", command=self.start_training, style="Primary.TButton")
         self._start_training_btn.pack(side=tk.LEFT, padx=(0, 12))
 
+        ttk.Button(button_frame, text="Save Config", command=self.generate_config).pack(side=tk.LEFT, padx=(0, 12))
+
         self._pause_training_btn = ttk.Button(button_frame, text="Pause Training", command=self._pause_training)
         self._pause_training_btn.pack(side=tk.LEFT, padx=(0, 12))
         self._pause_training_btn.pack_forget()  # hidden until training is running
@@ -12767,6 +12769,235 @@ class LoRATrainerGUI:
                 callback()
 
         threading.Thread(target=check_process, daemon=True).start()
+
+    def generate_config(self):
+        """Serialize current training settings to a TOML config file for headless use."""
+        if not self.validate_inputs():
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Save Training Config",
+            defaultextension=".toml",
+            filetypes=[("TOML files", "*.toml"), ("All files", "*.*")],
+            initialfile="train_config.toml",
+        )
+        if not path:
+            return
+
+        arch = self.architecture_var.get()
+        config = ARCHITECTURES.get(arch, ARCHITECTURES["Flux 2 Klein Base 9B"])
+
+        dit_path = self.settings["DIT_MODEL"]
+        dit_filename = os.path.basename(dit_path).lower()
+        mixed_precision = "fp16" if "fp16" in dit_filename else "bf16"
+
+        # Build network_args list (mirrors build_training_command logic)
+        network_args = [f"loraplus_lr_ratio={self.settings['LORA_LR_RATIO']}"]
+        preset = self.training_preset_var.get() if hasattr(self, "training_preset_var") else "Full Model"
+        STYLE_COMP_PATTERNS = [r".*double_blocks\..*", r".*single_blocks\.[01]\..*"]
+        IDENTITY_PATTERNS = [r".*single_blocks\.(1[0-6]|[1-9])\..*"]
+        DETAILS_PATTERNS = [r".*single_blocks\.(1[2-9]|2[0-3])\..*"]
+        patterns = None
+        if preset == "Identity":
+            patterns = IDENTITY_PATTERNS
+        elif preset in ("Style", "Style+Composition"):
+            patterns = STYLE_COMP_PATTERNS
+        elif preset == "Details":
+            patterns = DETAILS_PATTERNS
+        elif preset == "Custom":
+            patterns = self._build_custom_training_patterns()
+        if patterns:
+            quoted = ",".join(f'"{p.replace(chr(92), chr(92) * 2)}"' for p in patterns)
+            network_args.append(f"include_patterns=[{quoted}]")
+
+        toml_data = {}
+
+        # [models]
+        models = {
+            "dit": self.settings["DIT_MODEL"],
+            "vae": self.settings["VAE_MODEL"],
+            "dataset_config": self.settings["DATASET_CONFIG"],
+            "mixed_precision": mixed_precision,
+        }
+        if config["uses_text_encoder"]:
+            models["text_encoder"] = self.settings["TEXT_ENCODER"]
+        if arch.startswith("Wan"):
+            models["task"] = self.settings["MODEL_TYPE"]
+        elif config["uses_model_version"]:
+            models["model_version"] = config["model_version"]
+        toml_data["models"] = models
+
+        # [network]
+        network = {
+            "network_module": config["network_module"],
+            "network_dim": self.settings["NETWORK_DIM"],
+            "network_alpha": self.settings["NETWORK_ALPHA"],
+            "network_args": network_args,
+        }
+        network_dropout = self.settings.get("NETWORK_DROPOUT", 0)
+        if isinstance(network_dropout, str):
+            network_dropout = float(network_dropout) if network_dropout else 0
+        if network_dropout > 0:
+            network["network_dropout"] = network_dropout
+        toml_data["network"] = network
+
+        # [training]
+        training = {
+            "optimizer_type": self.settings["OPTIMIZER_TYPE"],
+            "learning_rate": self.settings["LEARNING_RATE"],
+            "max_train_epochs": self.settings["MAX_TRAIN_EPOCHS"],
+            "save_every_n_epochs": self.settings["SAVE_EVERY_N_EPOCHS"],
+            "seed": self.settings["SEED"],
+            "blocks_to_swap": self.settings["BLOCKS_SWAP"],
+            "timestep_sampling": self.settings["TIMESTEP_SAMPLING"],
+            "max_data_loader_n_workers": 2,
+            "persistent_data_loader_workers": True,
+            "save_state": True,
+            "gradient_checkpointing": self.settings.get("GRADIENT_CHECKPOINTING", True),
+        }
+        if self.settings.get("QUANT_4BIT", False):
+            training["quant_4bit"] = True
+        elif self.settings["FP8"]:
+            training["fp8_base"] = True
+            if self.settings["SCALED"]:
+                training["fp8_scaled"] = True
+        if self.settings["FP8_TEXT_ENCODER"] and config.get("fp8_text_encoder_flag"):
+            flag = config["fp8_text_encoder_flag"].lstrip("-").replace("-", "_")
+            training[flag] = True
+        if config.get("supports_discrete_flow_shift", True):
+            training["discrete_flow_shift"] = self.settings["DISCRETE_FLOW_SHIFT"]
+        ts_sampling = self.settings["TIMESTEP_SAMPLING"]
+        sigmoid_scale = self.settings.get("SIGMOID_SCALE", "1.0")
+        if ts_sampling in ("sigmoid", "shift") and sigmoid_scale and sigmoid_scale != "1.0":
+            training["sigmoid_scale"] = sigmoid_scale
+        min_ts = self.settings.get("MIN_TIMESTEP", "")
+        max_ts = self.settings.get("MAX_TIMESTEP", "")
+        if min_ts:
+            training["min_timestep"] = min_ts
+        if max_ts:
+            training["max_timestep"] = max_ts
+        if self.settings.get("PRESERVE_DISTRIBUTION", False):
+            training["preserve_distribution_shape"] = True
+        if self.settings["OPTIMIZER_ARGS"]:
+            training["optimizer_args"] = self.settings["OPTIMIZER_ARGS"]
+        gradient_accum = self.settings.get("GRADIENT_ACCUMULATION", 1)
+        if isinstance(gradient_accum, str):
+            gradient_accum = int(gradient_accum) if gradient_accum else 1
+        if gradient_accum > 1:
+            training["gradient_accumulation_steps"] = gradient_accum
+        max_grad_norm = self.settings.get("MAX_GRAD_NORM", 1.0)
+        if isinstance(max_grad_norm, str):
+            max_grad_norm = float(max_grad_norm) if max_grad_norm else 1.0
+        if max_grad_norm > 0:
+            training["max_grad_norm"] = max_grad_norm
+        attention = self.settings["ATTENTION_MECHANISM"]
+        if attention != "none":
+            training[attention] = True
+        if self.settings["IMG_IN_TXT_IN_OFFLOADING"]:
+            training["img_in_txt_in_offloading"] = True
+        adaptive_on = bool(self.settings.get("ADAPTIVE_LR", False))
+        lr_scheduler = "constant" if adaptive_on else self.settings["LR_SCHEDULER"]
+        if lr_scheduler:
+            training["lr_scheduler"] = lr_scheduler
+        if not adaptive_on:
+            if self.settings["LR_WARMUP_STEPS"]:
+                training["lr_warmup_steps"] = self.settings["LR_WARMUP_STEPS"]
+            if self.settings["LR_DECAY_STEPS"]:
+                training["lr_decay_steps"] = self.settings["LR_DECAY_STEPS"]
+        if adaptive_on:
+            training["adaptive_lr"] = True
+            min_lr = (self.settings.get("ADAPTIVE_LR_MIN", "1e-5") or "1e-5").split(" ")[0]
+            max_lr = (self.settings.get("ADAPTIVE_LR_MAX", "4e-4") or "4e-4").split(" ")[0]
+            training["adaptive_lr_min"] = min_lr
+            training["adaptive_lr_max"] = max_lr
+        ctx_path = self.settings.get("CONTEXT_LORA_PATH", "").strip()
+        if ctx_path:
+            training["context_lora_path"] = ctx_path
+            training["context_lora_strength"] = self.settings.get("CONTEXT_LORA_STRENGTH", "1.0") or "1.0"
+        weighting_scheme = self.settings["WEIGHTING_SCHEME"]
+        if weighting_scheme != "none":
+            training["weighting_scheme"] = weighting_scheme
+            if weighting_scheme == "logit_normal":
+                logit_mean = self.settings.get("LOGIT_MEAN", "0.0")
+                logit_std = self.settings.get("LOGIT_STD", "1.0")
+                if logit_mean and logit_mean != "0.0":
+                    training["logit_mean"] = logit_mean
+                if logit_std and logit_std != "1.0":
+                    training["logit_std"] = logit_std
+            elif weighting_scheme == "mode":
+                mode_scale = self.settings.get("MODE_SCALE", "1.29")
+                if mode_scale and mode_scale != "1.29":
+                    training["mode_scale"] = mode_scale
+        if self.settings["RESUME_TRAINING"].strip():
+            training["resume"] = self.settings["RESUME_TRAINING"].strip()
+        toml_data["training"] = training
+
+        # [output]
+        output = {
+            "output_dir": self.settings["LORA_OUTPUT_DIR"],
+            "output_name": self.settings["LORA_NAME"],
+            "pause_flag_path": os.path.join(self.settings["LORA_OUTPUT_DIR"], ".pause_requested"),
+        }
+        logging_dir = self.settings["LOGGING_DIR"]
+        if logging_dir:
+            output["logging_dir"] = logging_dir
+        log_with = self.settings["LOG_WITH"]
+        if log_with != "none":
+            output["log_with"] = log_with
+        log_prefix = self.settings["LOG_PREFIX"]
+        if log_prefix:
+            output["log_prefix"] = log_prefix
+        toml_data["output"] = output
+
+        # [metadata]
+        metadata = {}
+        for key, setting in [
+            ("metadata_title", "METADATA_TITLE"),
+            ("metadata_author", "METADATA_AUTHOR"),
+            ("metadata_description", "METADATA_DESCRIPTION"),
+            ("metadata_license", "METADATA_LICENSE"),
+            ("metadata_tags", "METADATA_TAGS"),
+        ]:
+            val = self.settings[setting]
+            if val:
+                metadata[key] = val
+        if metadata:
+            toml_data["metadata"] = metadata
+
+        # [sampling] — only if enabled and architecture supports it
+        if self.sample_enabled_var.get() and config.get("supports_samples", False):
+            sampling = {}
+            prompt_file = self.generate_sample_prompt_file()
+            sampling["sample_prompts"] = prompt_file
+            every_n_epochs = self.sample_every_n_epochs_var.get()
+            if every_n_epochs and int(every_n_epochs) > 0:
+                sampling["sample_every_n_epochs"] = int(every_n_epochs)
+            every_n_steps = self.sample_every_n_steps_var.get()
+            if every_n_steps and int(every_n_steps) > 0:
+                sampling["sample_every_n_steps"] = int(every_n_steps)
+            if self.sample_at_first_var.get():
+                sampling["sample_at_first"] = True
+            ref_img = getattr(self, "sample_ref_image_var", None)
+            ref_img = ref_img.get().strip() if ref_img else ""
+            if ref_img and os.path.exists(ref_img):
+                sampling["sample_ref_image"] = ref_img
+            if getattr(self, "use_distilled_samples_var", None) and self.use_distilled_samples_var.get():
+                distilled_path = self.prefs_vars.get("distilled_dit", tk.StringVar()).get()
+                if distilled_path and os.path.exists(distilled_path):
+                    sampling["sample_dit"] = distilled_path
+                    cache_mode = getattr(self, "cache_sample_model_var", None)
+                    cache_mode = cache_mode.get() if cache_mode else self.settings.get("CACHE_SAMPLE_MODEL", "auto")
+                    sampling["cache_sample_model"] = cache_mode
+            toml_data["sampling"] = sampling
+
+        try:
+            import toml as toml_lib
+            with open(path, "w", encoding="utf-8") as f:
+                toml_lib.dump(toml_data, f)
+            self.update_console(f"Config saved to: {path}\n")
+            messagebox.showinfo("Config Saved", f"Training config written to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e))
 
     def start_training(self):
         """Start training with sequential cache process execution"""
