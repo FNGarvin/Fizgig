@@ -1,5 +1,4 @@
-#!/bin/bash
-"exec" "$(dirname "$0")/venv/bin/python" "$0" "$@"
+#!/usr/bin/env python
 """
 Fizgig Preflight
 ================
