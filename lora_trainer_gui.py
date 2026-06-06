@@ -12792,6 +12792,18 @@ class LoRATrainerGUI:
             pv = self.prefs_vars.get(key, tk.StringVar()).get().strip()
             return pv or self.settings.get(setting_key, "")
 
+        # Produce relative paths where possible so the config is portable.
+        # Falls back to absolute (forward-slash normalised) for cross-drive paths (e.g. ComfyUI models).
+        toml_dir = os.path.dirname(os.path.abspath(path))
+        def _relpath(p):
+            if not p:
+                return p
+            try:
+                return os.path.relpath(p, toml_dir).replace("\\", "/")
+            except ValueError:
+                # Cross-drive on Windows — keep absolute but normalise slashes.
+                return p.replace("\\", "/")
+
         dit_path = _pref("base_dit", "DIT_MODEL")
         dit_filename = os.path.basename(dit_path).lower()
         mixed_precision = "fp16" if "fp16" in dit_filename else "bf16"
@@ -12819,13 +12831,13 @@ class LoRATrainerGUI:
 
         # [models]
         models = {
-            "dit": dit_path,
-            "vae": _pref("vae", "VAE_MODEL"),
-            "dataset_config": path,  # self-referential: dataset sections are embedded below
+            "dit": _relpath(dit_path),
+            "vae": _relpath(_pref("vae", "VAE_MODEL")),
+            "dataset_config": _relpath(path),  # self-referential: dataset sections are embedded below
             "mixed_precision": mixed_precision,
         }
         if config["uses_text_encoder"]:
-            models["text_encoder"] = _pref("text_encoder", "TEXT_ENCODER")
+            models["text_encoder"] = _relpath(_pref("text_encoder", "TEXT_ENCODER"))
         if arch.startswith("Wan"):
             models["task"] = self.settings["MODEL_TYPE"]
         elif config["uses_model_version"]:
@@ -12917,7 +12929,7 @@ class LoRATrainerGUI:
             training["adaptive_lr_max"] = max_lr
         ctx_path = self.settings.get("CONTEXT_LORA_PATH", "").strip()
         if ctx_path:
-            training["context_lora_path"] = ctx_path
+            training["context_lora_path"] = _relpath(ctx_path)
             training["context_lora_strength"] = self.settings.get("CONTEXT_LORA_STRENGTH", "1.0") or "1.0"
         weighting_scheme = self.settings["WEIGHTING_SCHEME"]
         if weighting_scheme != "none":
@@ -12934,18 +12946,18 @@ class LoRATrainerGUI:
                 if mode_scale and mode_scale != "1.29":
                     training["mode_scale"] = mode_scale
         if self.settings["RESUME_TRAINING"].strip():
-            training["resume"] = self.settings["RESUME_TRAINING"].strip()
+            training["resume"] = _relpath(self.settings["RESUME_TRAINING"].strip())
         toml_data["training"] = training
 
         # [output]
         output = {
-            "output_dir": self.settings["LORA_OUTPUT_DIR"],
+            "output_dir": _relpath(self.settings["LORA_OUTPUT_DIR"]),
             "output_name": self.settings["LORA_NAME"],
-            "pause_flag_path": os.path.join(self.settings["LORA_OUTPUT_DIR"], ".pause_requested"),
+            "pause_flag_path": _relpath(os.path.join(self.settings["LORA_OUTPUT_DIR"], ".pause_requested")),
         }
         logging_dir = self.settings["LOGGING_DIR"]
         if logging_dir:
-            output["logging_dir"] = logging_dir
+            output["logging_dir"] = _relpath(logging_dir)
         log_with = self.settings["LOG_WITH"]
         if log_with != "none":
             output["log_with"] = log_with
@@ -12973,7 +12985,7 @@ class LoRATrainerGUI:
         # sample_prompts points to this same file; load_prompts() handles .toml via [prompt]/[[prompt.subset]]
         if self.sample_enabled_var.get() and config.get("supports_samples", False):
             sampling = {}
-            sampling["sample_prompts"] = path
+            sampling["sample_prompts"] = _relpath(path)
             every_n_epochs = self.sample_every_n_epochs_var.get()
             if every_n_epochs and int(every_n_epochs) > 0:
                 sampling["sample_every_n_epochs"] = int(every_n_epochs)
@@ -12985,11 +12997,11 @@ class LoRATrainerGUI:
             ref_img = getattr(self, "sample_ref_image_var", None)
             ref_img = ref_img.get().strip() if ref_img else ""
             if ref_img and os.path.exists(ref_img):
-                sampling["sample_ref_image"] = ref_img
+                sampling["sample_ref_image"] = _relpath(ref_img)
             if getattr(self, "use_distilled_samples_var", None) and self.use_distilled_samples_var.get():
                 distilled_path = self.prefs_vars.get("distilled_dit", tk.StringVar()).get()
                 if distilled_path and os.path.exists(distilled_path):
-                    sampling["sample_dit"] = distilled_path
+                    sampling["sample_dit"] = _relpath(distilled_path)
                     cache_mode = getattr(self, "cache_sample_model_var", None)
                     cache_mode = cache_mode.get() if cache_mode else self.settings.get("CACHE_SAMPLE_MODEL", "auto")
                     sampling["cache_sample_model"] = cache_mode
@@ -13050,15 +13062,15 @@ class LoRATrainerGUI:
             ds_entry = {}
             cache_dir = self.prefs_vars["cache_dir"].get().strip() if "cache_dir" in self.prefs_vars else ""
             if is_jsonl:
-                jsonl_file = self.dataset_jsonl_file_var.get().strip().replace("\\", "/")
+                jsonl_file = self.dataset_jsonl_file_var.get().strip()
                 key = "video_jsonl_file" if is_video else "image_jsonl_file"
-                ds_entry[key] = jsonl_file
+                ds_entry[key] = _relpath(jsonl_file)
             elif is_video:
-                ds_entry["video_directory"] = self.dataset_video_dir_var.get().strip().replace("\\", "/")
+                ds_entry["video_directory"] = _relpath(self.dataset_video_dir_var.get().strip())
             else:
-                ds_entry["image_directory"] = self.image_folder_var.get().strip().replace("\\", "/")
+                ds_entry["image_directory"] = _relpath(self.image_folder_var.get().strip())
             if cache_dir:
-                ds_entry["cache_directory"] = cache_dir.replace("\\", "/")
+                ds_entry["cache_directory"] = _relpath(cache_dir)
             if is_video:
                 try:
                     target_frames = [int(x.strip()) for x in self.dataset_target_frames_var.get().split(",")]
