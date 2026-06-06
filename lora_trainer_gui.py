@@ -12787,7 +12787,12 @@ class LoRATrainerGUI:
         arch = self.architecture_var.get()
         config = ARCHITECTURES.get(arch, ARCHITECTURES["Flux 2 Klein Base 9B"])
 
-        dit_path = self.settings["DIT_MODEL"]
+        # Model paths live in prefs_vars at runtime; settings keys are intentionally blank in the preset.
+        def _pref(key, setting_key):
+            pv = self.prefs_vars.get(key, tk.StringVar()).get().strip()
+            return pv or self.settings.get(setting_key, "")
+
+        dit_path = _pref("base_dit", "DIT_MODEL")
         dit_filename = os.path.basename(dit_path).lower()
         mixed_precision = "fp16" if "fp16" in dit_filename else "bf16"
 
@@ -12814,13 +12819,13 @@ class LoRATrainerGUI:
 
         # [models]
         models = {
-            "dit": self.settings["DIT_MODEL"],
-            "vae": self.settings["VAE_MODEL"],
-            "dataset_config": self.settings["DATASET_CONFIG"],
+            "dit": dit_path,
+            "vae": _pref("vae", "VAE_MODEL"),
+            "dataset_config": path,  # self-referential: dataset sections are embedded below
             "mixed_precision": mixed_precision,
         }
         if config["uses_text_encoder"]:
-            models["text_encoder"] = self.settings["TEXT_ENCODER"]
+            models["text_encoder"] = _pref("text_encoder", "TEXT_ENCODER")
         if arch.startswith("Wan"):
             models["task"] = self.settings["MODEL_TYPE"]
         elif config["uses_model_version"]:
@@ -12964,11 +12969,11 @@ class LoRATrainerGUI:
         if metadata:
             toml_data["metadata"] = metadata
 
-        # [sampling] — only if enabled and architecture supports it
+        # [sampling] + [prompt] — only if enabled and architecture supports it
+        # sample_prompts points to this same file; load_prompts() handles .toml via [prompt]/[[prompt.subset]]
         if self.sample_enabled_var.get() and config.get("supports_samples", False):
             sampling = {}
-            prompt_file = self.generate_sample_prompt_file()
-            sampling["sample_prompts"] = prompt_file
+            sampling["sample_prompts"] = path
             every_n_epochs = self.sample_every_n_epochs_var.get()
             if every_n_epochs and int(every_n_epochs) > 0:
                 sampling["sample_every_n_epochs"] = int(every_n_epochs)
@@ -12989,6 +12994,82 @@ class LoRATrainerGUI:
                     cache_mode = cache_mode.get() if cache_mode else self.settings.get("CACHE_SAMPLE_MODEL", "auto")
                     sampling["cache_sample_model"] = cache_mode
             toml_data["sampling"] = sampling
+
+            # [prompt] block — inline prompt parameters consumed by load_prompts() for .toml files
+            prompt_text = self.sample_prompt_text.get("1.0", tk.END).strip()
+            prompt_block = {}
+            try:
+                prompt_block["width"] = int(self.sample_width_var.get())
+                prompt_block["height"] = int(self.sample_height_var.get())
+                prompt_block["steps"] = int(self.sample_steps_var.get())
+            except (ValueError, AttributeError):
+                pass
+            try:
+                cfg = float(self.sample_cfg_scale_var.get())
+                prompt_block["cfg_scale"] = cfg
+            except (ValueError, AttributeError):
+                pass
+            seed_str = self.sample_seed_var.get().strip() if hasattr(self, "sample_seed_var") else ""
+            if seed_str and seed_str != "0":
+                try:
+                    prompt_block["seed"] = int(seed_str)
+                except ValueError:
+                    pass
+            flow_shift = self.sample_flow_shift_var.get().strip() if hasattr(self, "sample_flow_shift_var") else ""
+            if flow_shift:
+                try:
+                    prompt_block["flow_shift"] = float(flow_shift)
+                except ValueError:
+                    pass
+            negative = self.sample_negative_var.get().strip() if hasattr(self, "sample_negative_var") else ""
+            if negative:
+                prompt_block["negative"] = negative
+            prompt_block["subset"] = [{"prompt": prompt_text}]
+            toml_data["prompt"] = prompt_block
+
+        # Embed dataset config inline so the output is a single self-contained file.
+        # dataset_config above points to this same file; load_user_config() will find
+        # [general] and [[datasets]] here and ignore the training sections.
+        try:
+            megapixels = float(self.dataset_megapixels_var.get())
+            side = (int(math.sqrt(max(megapixels, 0.01) * 1_000_000)) // 16) * 16
+            batch_size_ds = int(self.dataset_batch_size_var.get())
+            dataset_type = self.dataset_type_var.get()
+            is_video = "Video" in dataset_type
+            is_jsonl = "JSONL" in dataset_type
+            general = {
+                "resolution": [side, side],
+                "batch_size": batch_size_ds,
+                "num_repeats": 1,
+                "enable_bucket": bool(self.dataset_enable_bucket_var.get()),
+                "bucket_no_upscale": bool(self.dataset_no_upscale_var.get()),
+            }
+            if not is_jsonl:
+                general["caption_extension"] = self.dataset_caption_ext_var.get().strip()
+            toml_data["general"] = general
+            ds_entry = {}
+            cache_dir = self.prefs_vars["cache_dir"].get().strip() if "cache_dir" in self.prefs_vars else ""
+            if is_jsonl:
+                jsonl_file = self.dataset_jsonl_file_var.get().strip().replace("\\", "/")
+                key = "video_jsonl_file" if is_video else "image_jsonl_file"
+                ds_entry[key] = jsonl_file
+            elif is_video:
+                ds_entry["video_directory"] = self.dataset_video_dir_var.get().strip().replace("\\", "/")
+            else:
+                ds_entry["image_directory"] = self.image_folder_var.get().strip().replace("\\", "/")
+            if cache_dir:
+                ds_entry["cache_directory"] = cache_dir.replace("\\", "/")
+            if is_video:
+                try:
+                    target_frames = [int(x.strip()) for x in self.dataset_target_frames_var.get().split(",")]
+                    ds_entry["target_frames"] = target_frames
+                    ds_entry["frame_extraction"] = self.dataset_frame_extraction_var.get()
+                    ds_entry["source_fps"] = float(self.dataset_source_fps_var.get())
+                except ValueError:
+                    pass
+            toml_data["datasets"] = [ds_entry]
+        except (ValueError, AttributeError):
+            pass  # dataset fields unavailable; omit inline sections, fall back to separate file
 
         try:
             import toml as toml_lib

@@ -293,6 +293,16 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
         for key, value in section_dict.items():
             ignore_nesting_dict[key] = value
 
+    # fix: resolve relative paths relative to the TOML file's own directory so
+    # config files are portable — moving the file to another machine or folder
+    # works as long as relative paths inside it stay consistent.
+    toml_dir = os.path.dirname(os.path.abspath(config_path))
+    for key, value in ignore_nesting_dict.items():
+        if isinstance(value, str) and not os.path.isabs(value) and ("/" in value or "\\" in value or value.startswith(".")):
+            resolved = os.path.normpath(os.path.join(toml_dir, value))
+            if os.path.exists(resolved):
+                ignore_nesting_dict[key] = resolved
+
     config_args = argparse.Namespace(**ignore_nesting_dict)
     args = parser.parse_args(namespace=config_args)
     args.config_file = os.path.splitext(args.config_file)[0]
