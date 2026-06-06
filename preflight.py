@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/bin/bash
+"exec" "$(dirname "$0")/venv/bin/python" "$0" "$@"
 """
 Fizgig Preflight
 ================
@@ -208,9 +209,13 @@ def check_dataset(data, config_dir):
 
 def check_fizgig():
     _header("Fizgig training module")
+    # fizgig lives in src/ and is path-inserted at runtime rather than installed as a package
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
     spec = importlib.util.find_spec("fizgig.training.trainer")
     if spec is None:
-        _fail("fizgig.training.trainer is not importable — is the venv active and fizgig installed?")
+        _fail("fizgig.training.trainer is not importable — is the venv active and src/ present?")
         return 1
     _ok("fizgig.training.trainer is importable")
     return 0
