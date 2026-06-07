@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Fizgig Preflight
 ================
@@ -47,14 +47,22 @@ MODEL_REGISTRY = {
         "filename": "flux-2-klein-9b-fp8.safetensors",
         "gated": True,
     },
+    # VAE may be named ae.safetensors or train.ae.safetensors locally
     "ae": {
         "repo_id": "black-forest-labs/FLUX.2-dev",
         "filename": "ae.safetensors",
         "gated": True,
     },
+    "train.ae": {
+        "repo_id": "black-forest-labs/FLUX.2-dev",
+        "filename": "ae.safetensors",
+        "gated": True,
+    },
+    # Qwen: HF repo path has subdirs — download to flat dest, filename only
     "qwen_3_8b": {
         "repo_id": "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
         "filename": "split_files/text_encoders/qwen_3_8b.safetensors",
+        "local_filename": "qwen_3_8b.safetensors",  # flatten on download
         "gated": False,
     },
 }
@@ -233,61 +241,81 @@ def check_and_download_models(data, config_dir):
         (sampling_section, "sample_dit"),
     ]
 
+    # Models are always downloaded to <fizgig_root>/models/ regardless of what
+    # the config says — config paths are likely Windows-local and meaningless here.
+    # The config is patched after download to reflect the actual local paths.
+    fizgig_root = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(fizgig_root, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
     # Collect which entries need downloading and whether any are gated
     to_download = []
     needs_gated = False
+    errors = 0
     for section, key in model_keys:
         raw = section.get(key, "")
         if not raw:
             continue
+        # Use the registry's canonical local filename for the download destination,
+        # never the config's local name (which may be a user rename like train.ae.safetensors)
+        entry = _registry_entry(raw)
+        local_name = entry["local_filename"] if entry and "local_filename" in entry \
+                     else os.path.basename(entry["filename"]) if entry \
+                     else os.path.basename(raw)
+        local_path = os.path.join(models_dir, local_name)
         resolved = _resolve(raw, config_dir)
-        if os.path.exists(resolved):
-            _ok(f"{key}: {resolved}")
+        existing = resolved if os.path.exists(resolved) else local_path if os.path.exists(local_path) else None
+        if existing:
+            _ok(f"{key}: {existing}")
+            # Patch config if it pointed somewhere different (e.g. Windows path)
+            if section.get(key) != existing:
+                if key in data.get("models", {}):
+                    data["models"][key] = existing
+                elif key in data.get("sampling", {}):
+                    data["sampling"][key] = existing
         else:
-            entry = _registry_entry(resolved)
             if entry:
-                to_download.append((section, key, raw, resolved, entry))
+                to_download.append((section, key, entry, local_path))
                 if entry["gated"]:
                     needs_gated = True
-                _warn(f"{key}: not found — will download  ({os.path.basename(resolved)})")
+                _warn(f"{key}: not found — will download  ({local_name})")
             else:
-                _fail(f"{key}: not found and not in model registry: {resolved}")
+                _fail(f"{key}: not found and not in model registry: {os.path.basename(raw)}")
+                errors += 1
 
     if not to_download:
-        return data, 0
+        return data, errors
 
     # Auth check before any downloading
     check_hf_auth(needs_gated)
 
     from huggingface_hub import hf_hub_download
+    import shutil
 
-    patches = {}
-    errors = 0
-    for section, key, raw, resolved, entry in to_download:
-        dest_dir = os.path.dirname(resolved) if os.path.isabs(resolved) else config_dir
-        os.makedirs(dest_dir, exist_ok=True)
-        print(f"\n  Downloading {entry['filename']} from {entry['repo_id']} ...")
+    for section, key, entry, local_path in to_download:
+        local_name = os.path.basename(local_path)
+        print(f"\n  Downloading {local_name} from {entry['repo_id']} ...")
         try:
             downloaded = hf_hub_download(
                 repo_id=entry["repo_id"],
                 filename=entry["filename"],
-                local_dir=dest_dir,
+                local_dir=models_dir,
+                local_dir_use_symlinks=False,
             )
-            actual = os.path.normpath(downloaded)
-            _ok(f"Downloaded to: {actual}")
-            if actual != os.path.normpath(resolved):
-                patches[key] = actual
-                _warn(f"Path differs from config — will patch config")
+            # Flatten: if HF reproduced subdirs, move to flat models_dir/local_name
+            flat_path = os.path.join(models_dir, local_name)
+            if os.path.normpath(downloaded) != os.path.normpath(flat_path):
+                shutil.move(downloaded, flat_path)
+                downloaded = flat_path
+            _ok(f"Downloaded to: {downloaded}")
+            # Patch config to the actual local path
+            if key in data.get("models", {}):
+                data["models"][key] = downloaded
+            elif key in data.get("sampling", {}):
+                data["sampling"][key] = downloaded
         except Exception as e:
             _fail(f"Download failed for {key}: {e}")
             errors += 1
-
-    # Patch the config dict with corrected paths (caller will write back to disk)
-    for key, actual_path in patches.items():
-        if key in data.get("models", {}):
-            data["models"][key] = actual_path
-        elif key in data.get("sampling", {}):
-            data["sampling"][key] = actual_path
 
     return data, errors
 
