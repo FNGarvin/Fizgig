@@ -122,12 +122,15 @@ def check_hf_auth(needs_gated):
         _ok("HuggingFace — authenticated")
         return True
 
+    import subprocess, shutil
+    # 'hf auth login' is the current command; fall back to legacy 'huggingface-cli login'
+    login_cmd = ["hf", "auth", "login"] if shutil.which("hf") else ["huggingface-cli", "login"]
+
     if needs_gated:
         _warn("No HuggingFace token found.  The following models are gated and require authentication.")
-        answer = input("\n  Run 'huggingface-cli login' now? (y/n): ").strip().lower()
+        answer = input(f"\n  Run '{' '.join(login_cmd)}' now? (y/n): ").strip().lower()
         if answer == "y":
-            import subprocess
-            subprocess.run(["huggingface-cli", "login"], check=False)
+            subprocess.run(login_cmd, check=False)
             # Re-check after login attempt
             token = get_token()
             if token:
@@ -141,10 +144,9 @@ def check_hf_auth(needs_gated):
             sys.exit(1)
     else:
         _warn("No HuggingFace token — downloads will be anonymous (may be rate-limited).")
-        answer = input("\n  Run 'huggingface-cli login' for faster downloads? (y/n): ").strip().lower()
+        answer = input(f"\n  Run '{' '.join(login_cmd)}' for faster downloads? (y/n): ").strip().lower()
         if answer == "y":
-            import subprocess
-            subprocess.run(["huggingface-cli", "login"], check=False)
+            subprocess.run(login_cmd, check=False)
         return True
 
 # ---------------------------------------------------------------------------
@@ -307,6 +309,10 @@ def check_and_download_models(data, config_dir):
             if os.path.normpath(downloaded) != os.path.normpath(flat_path):
                 shutil.move(downloaded, flat_path)
                 downloaded = flat_path
+                # Clean up any empty subdirs HF created during download
+                for dirpath, dirnames, filenames in os.walk(models_dir, topdown=False):
+                    if dirpath != models_dir and not os.listdir(dirpath):
+                        os.rmdir(dirpath)
             _ok(f"Downloaded to: {downloaded}")
             # Patch config to the actual local path
             if key in data.get("models", {}):
@@ -353,11 +359,21 @@ def main():
         # Write back only if patches were made (toml.dump is idempotent but let's be tidy)
         write_patched_config(data, config_path)
 
+    # Write a ready-to-run shell script alongside the config
+    fizgig_root = os.path.dirname(os.path.abspath(__file__))
+    venv_python = os.path.join(fizgig_root, "venv", "bin", "python")
+    src_dir = os.path.join(fizgig_root, "src")
+    run_script = os.path.join(config_dir, "run_training.sh")
+    with open(run_script, "w", encoding="utf-8") as f:
+        f.write("#!/bin/bash\n")
+        f.write(f'PYTHONPATH="{src_dir}" "{venv_python}" -m fizgig.training.trainer --config_file "{config_path}"\n')
+    os.chmod(run_script, 0o755)
+
     _header("Summary")
     if errors == 0:
         print(f"\n  All checks passed.  Ready to train.\n")
         print(f"  Run:")
-        print(f"    python -m fizgig.training.trainer --config_file \"{config_path}\"\n")
+        print(f"    {run_script}\n")
     else:
         print(f"\n  {errors} issue(s) found.  Resolve the above before training.\n")
         sys.exit(1)
