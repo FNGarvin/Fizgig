@@ -298,7 +298,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
     # works as long as relative paths inside it stay consistent.
     toml_dir = os.path.dirname(os.path.abspath(config_path))
     for key, value in ignore_nesting_dict.items():
-        if isinstance(value, str) and not os.path.isabs(value) and ("/" in value or "\\" in value or value.startswith(".")):
+        if isinstance(value, str) and not os.path.isabs(value):
             resolved = os.path.normpath(os.path.join(toml_dir, value))
             if os.path.exists(resolved):
                 ignore_nesting_dict[key] = resolved
