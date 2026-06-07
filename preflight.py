@@ -15,7 +15,9 @@ What it checks:
 HF authentication:
   Checks for a cached token before any downloads.  Gated models (FLUX.2 family)
   require auth.  If no token is found the user is offered a standard
-  'huggingface-cli login' prompt — credentials are never handled by this script.
+  'hf auth login' prompt — credentials are never handled by this script.
+  In non-interactive environments (no TTY or HF_AUTH_NONINTERACTIVE=1), the
+  script fails fast rather than hanging on an unanswerable prompt.
 
 Usage:
   python preflight.py path/to/train_config.toml
@@ -26,6 +28,7 @@ import os
 import sys
 import glob
 import importlib.util
+import shutil
 
 # ---------------------------------------------------------------------------
 # Model registry — maps filename stems to HF repo + filename + gated flag
@@ -101,6 +104,13 @@ def _registry_entry(path):
     """Look up a model path in the registry by filename stem."""
     return MODEL_REGISTRY.get(_stem(path))
 
+def _is_noninteractive():
+    """True when running in a non-interactive environment (no TTY or env flag set)."""
+    return (
+        os.getenv("HF_AUTH_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
+        or not sys.stdin.isatty()
+    )
+
 # ---------------------------------------------------------------------------
 # Auth check
 # ---------------------------------------------------------------------------
@@ -108,8 +118,11 @@ def _registry_entry(path):
 def check_hf_auth(needs_gated):
     """
     Check for a cached HF token.  If gated models are needed and no token is
-    found, offer to run 'huggingface-cli login'.  Returns True if it's safe to
-    proceed with downloads.
+    found, offer to run 'hf auth login'.  Returns True if it's safe to proceed
+    with downloads.
+
+    In non-interactive environments (no TTY or HF_AUTH_NONINTERACTIVE=1) the
+    function fails fast rather than hanging on an unanswerable prompt.
     """
     try:
         from huggingface_hub import get_token
@@ -122,16 +135,24 @@ def check_hf_auth(needs_gated):
         _ok("HuggingFace — authenticated")
         return True
 
-    import subprocess, shutil
-    # 'hf auth login' is the current command; fall back to legacy 'huggingface-cli login'
+    # 'hf auth login' is the current command; fall back to legacy 'huggingface-cli login'.
+    # login_cmd is constructed from shutil.which() results — not user-controlled input.
     login_cmd = ["hf", "auth", "login"] if shutil.which("hf") else ["huggingface-cli", "login"]
+    login_cmd_str = " ".join(login_cmd)
+    non_interactive = _is_noninteractive()
 
     if needs_gated:
         _warn("No HuggingFace token found.  The following models are gated and require authentication.")
-        answer = input(f"\n  Run '{' '.join(login_cmd)}' now? (y/n): ").strip().lower()
+        if non_interactive:
+            _fail(
+                f"Non-interactive environment — cannot prompt for login.\n"
+                f"  Run '{login_cmd_str}' in an interactive shell first, or set HF_TOKEN."
+            )
+            sys.exit(1)
+        answer = input(f"\n  Run '{login_cmd_str}' now? (y/n): ").strip().lower()
         if answer == "y":
-            subprocess.run(login_cmd, check=False)
-            # Re-check after login attempt
+            import subprocess
+            subprocess.run(login_cmd, check=False)  # noqa: S603 — cmd built from which(), not user input
             token = get_token()
             if token:
                 _ok("HuggingFace — authenticated")
@@ -144,9 +165,11 @@ def check_hf_auth(needs_gated):
             sys.exit(1)
     else:
         _warn("No HuggingFace token — downloads will be anonymous (may be rate-limited).")
-        answer = input(f"\n  Run '{' '.join(login_cmd)}' for faster downloads? (y/n): ").strip().lower()
-        if answer == "y":
-            subprocess.run(login_cmd, check=False)
+        if not non_interactive:
+            answer = input(f"\n  Run '{login_cmd_str}' for faster downloads? (y/n): ").strip().lower()
+            if answer == "y":
+                import subprocess
+                subprocess.run(login_cmd, check=False)  # noqa: S603 — cmd built from which(), not user input
         return True
 
 # ---------------------------------------------------------------------------
@@ -181,7 +204,16 @@ def check_dataset(data, config_dir):
     _header("Dataset")
     errors = 0
 
-    image_dir = _resolve(data.get("datasets", [{}])[0].get("image_directory", ""), config_dir)
+    # Normalise datasets — TOML [[datasets]] produces a list, but guard against
+    # malformed configs that produce a dict or an empty collection.
+    datasets = data.get("datasets", [])
+    if isinstance(datasets, dict):
+        datasets = [datasets]
+    if not datasets:
+        _fail("No [[datasets]] section found in config")
+        return 1
+
+    image_dir = _resolve(datasets[0].get("image_directory", ""), config_dir)
     if not image_dir:
         _fail("No image_directory found in [[datasets]]")
         return 1
@@ -266,7 +298,8 @@ def check_and_download_models(data, config_dir):
                      else os.path.basename(raw)
         local_path = os.path.join(models_dir, local_name)
         resolved = _resolve(raw, config_dir)
-        existing = resolved if os.path.exists(resolved) else local_path if os.path.exists(local_path) else None
+        # Use os.path.isfile — os.path.exists also matches directories
+        existing = resolved if os.path.isfile(resolved) else local_path if os.path.isfile(local_path) else None
         if existing:
             _ok(f"{key}: {existing}")
             # Patch config if it pointed somewhere different (e.g. Windows path)
@@ -292,7 +325,6 @@ def check_and_download_models(data, config_dir):
     check_hf_auth(needs_gated)
 
     from huggingface_hub import hf_hub_download
-    import shutil
 
     for section, key, entry, local_path in to_download:
         local_name = os.path.basename(local_path)
@@ -332,6 +364,32 @@ def write_patched_config(data, config_path):
         toml.dump(data, f)
     _ok(f"Config patched and saved: {config_path}")
 
+
+def write_run_script(config_path):
+    """Write a platform-appropriate training launcher alongside the config."""
+    fizgig_root = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.join(fizgig_root, "src")
+    config_dir = os.path.dirname(config_path)
+
+    if os.name == "nt":
+        # Windows — write a .bat file
+        venv_python = os.path.join(fizgig_root, "venv", "Scripts", "python.exe")
+        run_script = os.path.join(config_dir, "run_training.bat")
+        with open(run_script, "w", encoding="utf-8") as f:
+            f.write("@echo off\n")
+            f.write(f'set PYTHONPATH={src_dir}\n')
+            f.write(f'"{venv_python}" -m fizgig.training.trainer --config_file "{config_path}"\n')
+    else:
+        # POSIX
+        venv_python = os.path.join(fizgig_root, "venv", "bin", "python")
+        run_script = os.path.join(config_dir, "run_training.sh")
+        with open(run_script, "w", encoding="utf-8") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f'PYTHONPATH="{src_dir}" "{venv_python}" -m fizgig.training.trainer --config_file "{config_path}"\n')
+        os.chmod(run_script, 0o755)
+
+    return run_script
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -355,22 +413,11 @@ def main():
     data, model_errors = check_and_download_models(data, config_dir)
     errors += model_errors
 
-    if model_errors == 0 and data:
-        # Write back only if patches were made (toml.dump is idempotent but let's be tidy)
-        write_patched_config(data, config_path)
-
-    # Write a ready-to-run shell script alongside the config
-    fizgig_root = os.path.dirname(os.path.abspath(__file__))
-    venv_python = os.path.join(fizgig_root, "venv", "bin", "python")
-    src_dir = os.path.join(fizgig_root, "src")
-    run_script = os.path.join(config_dir, "run_training.sh")
-    with open(run_script, "w", encoding="utf-8") as f:
-        f.write("#!/bin/bash\n")
-        f.write(f'PYTHONPATH="{src_dir}" "{venv_python}" -m fizgig.training.trainer --config_file "{config_path}"\n')
-    os.chmod(run_script, 0o755)
-
     _header("Summary")
     if errors == 0:
+        # Only write outputs when all checks pass — no partial modifications on failure
+        write_patched_config(data, config_path)
+        run_script = write_run_script(config_path)
         print(f"\n  All checks passed.  Ready to train.\n")
         print(f"  Run:")
         print(f"    {run_script}\n")
