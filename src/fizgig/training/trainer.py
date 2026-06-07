@@ -1887,6 +1887,12 @@ class KleinTrainer:
         blueprint_generator = BlueprintGenerator(ConfigSanitizer())
         logger.info(f"Loading dataset config from {args.dataset_config}")
         user_config = load_user_config(args.dataset_config)
+        # Fat configs (produced by the GUI's Save Config button) contain extra
+        # top-level sections ([models], [training], [sampling], [prompt], etc.)
+        # that the voluptuous dataset validator rejects as "extra keys".  Strip
+        # to the two keys BlueprintGenerator actually reads before validating.
+        dataset_keys = {"general", "datasets"}
+        user_config = {k: v for k, v in user_config.items() if k in dataset_keys}
         blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
         train_dataset_group = generate_dataset_group_by_blueprint(
             blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
