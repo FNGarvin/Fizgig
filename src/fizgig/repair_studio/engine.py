@@ -109,6 +109,7 @@ class RepairEngine:
         self._turbo_enabled: bool = False
         self._act_cache: Optional[dict] = None       # timestep_idx → ActivationCacheEntry
         self._act_cache_key: Optional[tuple] = None   # (primary_path, donor_path, seed, prompt, w, h)
+        self._act_cache_state: Optional[SliderState] = None  # the state the cache reflects (resume diff)
 
         # Prompt encoding cache — avoids reloading TE + re-encoding on slider-only changes
         self._prompt_cache_key: Optional[tuple] = None   # (prompt, primary_path)
@@ -117,6 +118,10 @@ class RepairEngine:
         # Reference-image encode cache — avoids re-running the VAE on slider tweaks
         self._ref_cache_key: Optional[tuple] = None   # (path, megapixels, strength)
         self._ref_cache: Optional[tuple] = None       # (ref_tokens, ref_ids)
+
+        # Clean latent of the most recent generate_preview ([128, H/16, W/16]).
+        # Sequential travel feeds this back as the next frame's reference latent.
+        self._last_frame_latent = None
 
         # Cache the last-generated baseline keyed on (primary_path, seed,
         # prompt, w, h) — only regenerate baseline when these change.
@@ -137,6 +142,7 @@ class RepairEngine:
         fp8_scaled: bool = False,
         fp8_text_encoder: bool = True,
         blocks_to_swap: int = 0,
+        int8: bool = False,
     ) -> None:
         """Lazy-load the Klein pipeline. No-op if already loaded.
 
@@ -158,6 +164,7 @@ class RepairEngine:
             fp8_scaled=fp8_scaled,
             fp8_text_encoder=fp8_text_encoder,
             blocks_to_swap=blocks_to_swap,
+            int8=int8,
         )
         # Offload TE to CPU between calls (saves ~8GB). generate_preview
         # reloads it to GPU before each encode.
@@ -352,13 +359,16 @@ class RepairEngine:
         """Release all cached activation tensors."""
         self._act_cache = None
         self._act_cache_key = None
+        self._act_cache_state = None
 
-    def _compute_resume_point(self) -> Optional[tuple]:
-        """From _changed_blocks, find the earliest block to resume from."""
-        if not self._changed_blocks:
+    def _compute_resume_point(self, changed) -> Optional[tuple]:
+        """Earliest block to resume from, given the list of changed block ids (a state diff).
+        Doubles run before singles, so any changed double resumes from that double; otherwise
+        the earliest changed single."""
+        if not changed:
             return None
-        doubles = sorted(int(b.split("_")[1]) for b in self._changed_blocks if b.startswith("double_"))
-        singles = sorted(int(b.split("_")[1]) for b in self._changed_blocks if b.startswith("single_"))
+        doubles = sorted(int(b.split("_")[1]) for b in changed if b.startswith("double_"))
+        singles = sorted(int(b.split("_")[1]) for b in changed if b.startswith("single_"))
         if doubles:
             return ("double", doubles[0])
         if singles:
@@ -383,15 +393,17 @@ class RepairEngine:
                 self.donor_network.set_module_multiplier_by_pattern(pat, bs.donor_strength, target="unet")
 
     def mark_blocks_changed(self, block_ids: List[str]) -> None:
-        """v2 hook — UI calls this BEFORE generate_preview with diffed block ids.
-        v1: noop (kept on the engine, not on SliderState, so presets stay clean)."""
-        self._changed_blocks.update(block_ids)
+        # No-op compatibility shim: the resume point is now derived from a state diff against
+        # _act_cache_state at render time (race-free), not a mutable changed-set that could be
+        # cleared mid-render and drop edits made while a preview was in flight.
+        pass
 
     # ------------------------------------------------------------------
     # Generation — the single preview entry point (v2 replaces body only)
     # ------------------------------------------------------------------
 
-    def _build_ref_tokens(self, state: SliderState):
+    def _build_ref_tokens(self, state: SliderState, prev_latent=None,
+                          prev_latent_strength=1.0):
         """Encode reference image(s) into (ref_tokens, ref_ids) for edit-conditioning.
 
         Klein is an edit model and supports MULTIPLE references: the primary
@@ -402,11 +414,18 @@ class RepairEngine:
         ref2 = previous frame (temporal continuity) — the original re-injects clean
         detail every frame so VAE feedback drift can't accumulate.
 
-        Caps each to ref_megapixels (downscale only, ×16). The ref latent goes in
-        the POSITIVE conditioning (caller concatenates onto the cond pass only).
+        `prev_latent` (optional): the previous frame's CLEAN latent ([128, H/16,
+        W/16], as cached by generate_preview). When supplied it is packed directly
+        as the previous-frame reference — skipping the lossy decode→PNG→encode round
+        trip the image path incurs. This is what keeps sequential travel sharp at
+        high strength. It is appended LAST (image 1 = original anchor, image 2 =
+        previous-frame latent), and the token cache is bypassed (it changes per frame).
+
+        Caps each image to ref_megapixels (downscale only, ×16). The ref latent goes
+        in the POSITIVE conditioning (caller concatenates onto the cond pass only).
         Returns (None, None) when no ref is set."""
         mp = max(0.05, float(getattr(state, "ref_megapixels", 1.0) or 1.0))
-        # Collect references in order: primary, then optional second anchor.
+        # Collect image references in order: primary, then optional second anchor.
         refs = []
         p1 = (getattr(state, "ref_image_path", "") or "").strip()
         s1 = float(getattr(state, "ref_strength", 1.0))
@@ -416,12 +435,16 @@ class RepairEngine:
         s2 = float(getattr(state, "ref2_strength", 1.0))
         if p2 and os.path.exists(p2) and s2 != 0.0:
             refs.append((p2, s2))
-        if not refs:
+        use_prev_latent = (prev_latent is not None
+                           and float(prev_latent_strength) != 0.0)
+        if not refs and not use_prev_latent:
             return None, None
 
-        # Cache the packed tokens for the exact ref set (skip re-encode on slider tweaks).
+        # Cache the packed tokens for the exact image ref set (skip re-encode on
+        # slider tweaks). A latent ref changes every frame, so bypass the cache then.
         ref_key = (tuple((p, round(s, 4)) for p, s in refs), round(mp, 4))
-        if self._ref_cache_key == ref_key and self._ref_cache is not None:
+        if (not use_prev_latent and self._ref_cache_key == ref_key
+                and self._ref_cache is not None):
             return self._ref_cache
 
         import numpy as np
@@ -458,12 +481,21 @@ class RepairEngine:
             if vae_dev.type != pipeline.device.type:
                 pipeline.vae.to(vae_dev)
 
+        # Previous-frame latent goes in directly (no VAE round trip), last in order
+        # so it reads as "image 2" after any clean original anchor.
+        if use_prev_latent:
+            lat = prev_latent.to(pipeline.device, dtype=pipeline.vae.dtype)
+            if float(prev_latent_strength) != 1.0:
+                lat = lat * float(prev_latent_strength)
+            latents.append(lat)
+
         ref_tokens, ref_ids = pack_control_latent(latents)
         ref_tokens = ref_tokens.to(device=pipeline.device, dtype=torch.bfloat16)
         ref_ids = ref_ids.to(pipeline.device)
 
-        self._ref_cache_key = ref_key
-        self._ref_cache = (ref_tokens, ref_ids)
+        if not use_prev_latent:
+            self._ref_cache_key = ref_key
+            self._ref_cache = (ref_tokens, ref_ids)
         return ref_tokens, ref_ids
 
     def encode_travel_prompts(self, prompts):
@@ -561,7 +593,8 @@ class RepairEngine:
         return torch.lerp(a, b, local).to(vecs[i].dtype)
 
     def generate_preview(self, state: SliderState, seed_b=None, travel_t=None,
-                         override_ctx=None, override_neg_ctx=None) -> Image.Image:
+                         override_ctx=None, override_neg_ctx=None,
+                         prev_latent=None, prev_latent_strength=1.0) -> Image.Image:
         """Apply state, run a 4-step Distilled generation, return PIL image.
 
         Seed travel: when `seed_b` is given, the initial noise is a spherical
@@ -699,7 +732,8 @@ class RepairEngine:
         # Reference image (Klein edit conditioning) — encode once, inject into the
         # positive/cond forward only. Disables Turbo (the activation cache is keyed
         # without the ref sequence) and shifts no other behavior when absent.
-        ref_tokens, ref_ids = self._build_ref_tokens(state)
+        ref_tokens, ref_ids = self._build_ref_tokens(
+            state, prev_latent=prev_latent, prev_latent_strength=prev_latent_strength)
         has_ref = ref_tokens is not None
         if has_ref:
             dlog(f"ref active: tokens={list(ref_tokens.shape)} "
@@ -726,6 +760,10 @@ class RepairEngine:
                      state.prompt, width, height,
                      state.ref_image_path, round(float(state.ref_megapixels), 4),
                      round(float(state.ref_strength), 4))
+        # Resume point from a STATE DIFF against what the cache was built from — race-free, so
+        # edits made while a previous render was in flight are never dropped.
+        changed = (state.diff_blocks(self._act_cache_state)
+                   if self._act_cache_state is not None else None)
         can_use_cache = (
             self._turbo_enabled
             and pipeline.is_distilled
@@ -733,12 +771,12 @@ class RepairEngine:
             and not bypass_cache
             and self._act_cache is not None
             and self._act_cache_key == cache_key
-            and self._changed_blocks
+            and changed
         )
         # No VRAM pre-check — the try/except around forward_cached() handles
         # OOM gracefully by falling back to full forward.
 
-        resume_point = self._compute_resume_point() if can_use_cache else None
+        resume_point = self._compute_resume_point(changed) if can_use_cache else None
         if resume_point:
             dlog(f"Turbo resume from {resume_point[0]}_{resume_point[1]}")
         elif self._turbo_enabled and pipeline.is_distilled:
@@ -804,10 +842,11 @@ class RepairEngine:
                 x = x + (t_prev - t_curr) * pred
                 dlog(f"  x after step: {_stats(x)}")
 
-            # Store cache for next preview
+            # Store cache for next preview (+ the state it reflects, for the resume diff)
             if self._turbo_enabled and not turbo_fallback and new_cache:
                 self._act_cache = new_cache
                 self._act_cache_key = cache_key
+                self._act_cache_state = state.copy()
         elif has_ref:
             # Base + CFG with a reference: the ref conditions the POSITIVE pass
             # only (uncond stays ref-free), mirroring ComfyUI's ReferenceLatent.
@@ -839,6 +878,12 @@ class RepairEngine:
         latent = x.to(pipeline.vae.dtype)
         del x
 
+        # Cache the clean latent ([128, H/16, W/16] — same space as vae.encode) so
+        # sequential travel can reuse it as the NEXT frame's reference latent directly,
+        # skipping the lossy decode→PNG→encode round trip that otherwise compounds each
+        # frame (the cause of quality loss at high sequential-reference strength).
+        self._last_frame_latent = latent[0].detach().clone()
+
         # Phase boundary 3: release DiT activation scratch before VAE claims GPU.
         clean_memory_on_device(device)
 
@@ -868,8 +913,6 @@ class RepairEngine:
         except Exception:
             logger.exception("Failed to write diagnostic log")
 
-        # v2 hook: clear after preview so next mark_blocks_changed accumulates fresh.
-        self._changed_blocks.clear()
         return img
 
     def generate_baseline(self, state: SliderState) -> Image.Image:
