@@ -3,8 +3,8 @@
 Fizgig Installer
 ================
 Sets up Fizgig with its own Python virtual environment.
-Installs PyTorch built against CUDA 12.8 — required for Klein 9B training, preview
-rendering, profiling, extraction, and Repair Studio on NVIDIA GPUs.
+Installs PyTorch built against CUDA 12.8 — required for Klein 9B and Krea 2 training,
+preview rendering, profiling, extraction, and Repair Studio on NVIDIA GPUs.
 
 Features:
 - Creates isolated venv for Fizgig dependencies
@@ -105,12 +105,21 @@ def install_dependencies():
     print("Upgrading pip...")
     subprocess.run([str(python_path), "-m", "pip", "install", "--upgrade", "pip"], check=True)
 
-    print(f"Installing dependencies from: {REQUIREMENTS_FILE}")
+    print("Installing uv...")
+    # shell=False (list form) with internal Path constants — not injectable
+    subprocess.run([str(python_path), "-m", "pip", "install", "--upgrade", "uv"], check=True)
+
+    print(f"Installing dependencies from: {REQUIREMENTS_FILE} (using uv)")
     print("(This may take a few minutes for PyTorch download...)")
 
     try:
+        # shell=False (list form) with internal Path constants — not injectable.
+        # --link-mode=copy: the uv cache and the venv are often on different drives
+        # (e.g. cache on C:, install on S:), where hardlinking isn't possible — copy
+        # mode avoids the noisy "Failed to hardlink" warning.
         subprocess.run(
-            [str(python_path), "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)],
+            [str(python_path), "-m", "uv", "pip", "install", "--link-mode", "copy",
+             "--index-strategy", "unsafe-best-match", "-r", str(REQUIREMENTS_FILE)],
             check=True
         )
         print("Dependencies installed successfully.")
@@ -144,7 +153,7 @@ if torch.cuda.is_available():
         sys.exit(1)
 else:
     print("WARN PyTorch installed but torch.cuda.is_available() is False.")
-    print("     Klein 9B training needs a CUDA-capable GPU.")
+    print("     Fizgig training (Klein 9B / Krea 2) needs a CUDA-capable GPU.")
     print("     If you have one, update your NVIDIA driver to 555+ and re-run this installer.")
     sys.exit(1)
 '''
@@ -277,7 +286,7 @@ def print_summary():
 
 
 def main():
-    print_header("Fizgig Installer")
+    print_header("Fizgig Installer — Klein 9B & Krea 2 LoRA Workbench")
     print(f"Installation directory: {SCRIPT_DIR}")
 
     # Step 1: Check Python version

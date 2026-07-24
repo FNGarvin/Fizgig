@@ -411,6 +411,9 @@ class BucketBatchManager:
                     content_key = "latents"
                 elif key == "text_embed":
                     content_key = "ctx_vec"
+                elif key in ("hidden_states", "attention_mask"):
+                    # Krea 2 text cache: multi-layer Qwen3-VL stack + validity mask
+                    content_key = key
                 else:
                     # Fallback: strip dtype suffix for compatibility with any
                     # legacy keys that might exist in merged caches
@@ -431,6 +434,10 @@ class BucketBatchManager:
             stacked["timesteps"] = self.timestep_pool[idx][:end - start]
         else:
             stacked["timesteps"] = None
+
+        # Per-image identity for the (passive) per-image loss logger. Harmless list of strings that
+        # trainers ignore unless logging is enabled.
+        stacked["item_keys"] = [item_info.item_key for item_info in bucket[start:end]]
 
         return stacked
 
@@ -785,6 +792,19 @@ class ImageDataset(torch.utils.data.Dataset):
 
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
+        # The training set is built from CACHE files, not from the image folder — so stale cache
+        # entries get silently TRAINED ON: an image deleted from the dataset lingers as its cache,
+        # and a cache directory shared across datasets mixes the previous dataset straight into
+        # this run. Cross-check every cache item against the images actually present and skip the
+        # orphans. (Cache filenames are the image basename without extension.)
+        valid_keys = None
+        if self.image_directory and os.path.isdir(self.image_directory):
+            _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            valid_keys = {os.path.splitext(f)[0] for f in os.listdir(self.image_directory)
+                          if os.path.splitext(f)[1].lower() in _exts}   # images only — a leftover
+            #                                       caption .txt must not keep a deleted image alive
+        skipped_stale = 0
+
         bucketed: dict[Tuple[int, int], list[ItemInfo]] = {}
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
@@ -794,6 +814,9 @@ class ImageDataset(torch.utils.data.Dataset):
             image_size = (image_width, image_height)
 
             item_key = "_".join(tokens[:-2])
+            if valid_keys is not None and item_key not in valid_keys:
+                skipped_stale += 1
+                continue
             te_cache = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
             if not os.path.exists(te_cache):
                 logger.warning(f"Text encoder cache not found: {te_cache}")
@@ -807,6 +830,12 @@ class ImageDataset(torch.utils.data.Dataset):
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
             bucketed[bucket_reso] = bucket
+
+        if skipped_stale:
+            logger.warning(
+                f"[dataset] ignored {skipped_stale} stale cache file(s) in {self.cache_directory} "
+                f"with no matching image in {self.image_directory} — deleted images or another "
+                f"dataset's leftovers. They are NOT trained on; delete them to silence this.")
 
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
