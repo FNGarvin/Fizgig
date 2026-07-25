@@ -37,12 +37,17 @@ tqdm==4.67.1
 # HuggingFace
 huggingface-hub==0.34.3
 
-# Face detection (for data preparation)
+# Face detection (for data preparation + ArcFace identity loss)
 insightface>=0.7.0
-onnxruntime>=1.15.0
+onnxruntime-gpu>=1.15.0  # plain onnxruntime silently runs InsightFace on CPU (~330x slower) even with a GPU present
 
 # AI Captioning (Florence-2)
 timm>=0.9.0
+
+# Perceptual auxiliary losses (depth/identity/mask/body-proportion, --*_loss_weight flags)
+onnx2torch>=1.5.15  # differentiable ArcFace + MediaPipe FaceMesh V2 (loaded as pre-converted .pth via huggingface_hub)
+ultralytics>=8.3.0  # YOLO person detector for subject masks
+dsntnn  # integral regression for ViTPose body-proportion keypoints (latest PyPI release is 0.5.x)
 
 # Misc
 pyyaml==6.0.3

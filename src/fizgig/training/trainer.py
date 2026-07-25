@@ -2280,6 +2280,149 @@ class KleinTrainer:
 
         loss_recorder = LossRecorder()
         save_dtype = dit_dtype
+
+        # ------------------------------------------------------------------
+        # Perceptual auxiliary losses — cache pass + encoder setup
+        # ------------------------------------------------------------------
+        _any_perceptual = (
+            getattr(args, 'depth_loss_weight', 0.0) > 0
+            or getattr(args, 'face_loss_weight', 0.0) > 0
+            or getattr(args, 'landmark_loss_weight', 0.0) > 0
+            or getattr(args, 'subject_mask_weight', 0.0) > 0
+            or getattr(args, 'body_proportion_loss_weight', 0.0) > 0
+        )
+
+        _depth_encoder = None   # DifferentiableDepthEncoder, live for training
+        _face_encoder = None    # DifferentiableFaceEncoder
+        _landmark_encoder = None  # DifferentiableLandmarkEncoder
+        _body_prop_encoder = None  # DifferentiableBodyProportionEncoder
+
+        if _any_perceptual:
+            # Load VAE for the GT caching round-trip and for x0 decode at train time.
+            if vae is None:
+                accelerator.print("[perceptual] Loading VAE for x0 decode and GT caching...")
+                vae = self.load_vae_model(args, vae_dtype=vae_dtype, vae_path=args.vae)
+                vae.requires_grad_(False)
+                vae.eval()
+                vae.to(accelerator.device)
+
+            from fizgig.perceptual.adapter import build_perceptual_adapters
+            from fizgig.perceptual.config import (
+                DepthConsistencyConfig, FaceIDConfig, SubjectMaskConfig
+            )
+
+            accelerator.print("[perceptual] Building dataset adapters...")
+            _adapters = build_perceptual_adapters(train_dataset_group)
+            accelerator.print(f"[perceptual] {len(_adapters)} unique (image, bucket) pairs")
+
+            # ------ Phase 1: Depth GT caching ------
+            if getattr(args, 'depth_loss_weight', 0.0) > 0:
+                from fizgig.perceptual.depth_consistency import (
+                    DifferentiableDepthEncoder, cache_depth_gt_embeddings
+                )
+                _depth_cfg = DepthConsistencyConfig(
+                    model_id=args.depth_da2_model_id,
+                    ssi_weight=args.depth_ssi_weight,
+                    grad_weight=args.depth_grad_weight,
+                    pixel_blur_sigma=args.depth_pixel_blur_sigma,
+                    loss_min_t=args.depth_loss_min_t,
+                    loss_max_t=args.depth_loss_max_t,
+                )
+
+                def _vae_roundtrip(pixels):
+                    """pixels: (1, 3, H, W) in [0, 1] → decoded (1, 3, H, W) in [0, 1]."""
+                    with torch.no_grad():
+                        pixels_11 = pixels * 2.0 - 1.0     # [0,1] → [-1,1]
+                        z = vae.encode(pixels_11.to(vae_dtype, non_blocking=True))
+                        dec = vae.decode(z)
+                        return (dec.clamp(-1.0, 1.0) + 1.0) * 0.5  # → [0,1]
+
+                accelerator.print("[perceptual] Caching GT depth maps (v3 VAE-roundtrip)...")
+                cache_depth_gt_embeddings(
+                    _adapters, _depth_cfg,
+                    device=accelerator.device,
+                    vae_roundtrip_fn=_vae_roundtrip,
+                )
+                for _a in _adapters:
+                    _a.sync()
+                _n_depth = sum(1 for _a in _adapters if _a.is_depth_cached)
+                accelerator.print(f"[perceptual] Depth GT cached for {_n_depth}/{len(_adapters)} images")
+
+                accelerator.print("[perceptual] Loading DA2 depth encoder for training...")
+                _depth_encoder = DifferentiableDepthEncoder(
+                    model_id=args.depth_da2_model_id,
+                    dtype=dit_dtype,
+                    device=accelerator.device,
+                    grad_checkpoint=True,
+                )
+
+            # ------ Phase 2: Face identity + landmark caching ------
+            _face_cfg = None
+            if getattr(args, 'face_loss_weight', 0.0) > 0 or getattr(args, 'landmark_loss_weight', 0.0) > 0:
+                from fizgig.perceptual.face_id import (
+                    DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
+                )
+                _face_cfg = FaceIDConfig(
+                    face_model=args.face_id_model,
+                    identity_loss_weight=args.face_loss_weight,
+                    landmark_loss_weight=args.landmark_loss_weight,
+                    identity_loss_min_t=args.face_loss_min_t,
+                    identity_loss_max_t=args.face_loss_max_t,
+                )
+                accelerator.print("[perceptual] Caching face embeddings...")
+                cache_face_embeddings(_adapters, _face_cfg)
+                for _a in _adapters:
+                    _a.sync()
+                _n_face = sum(1 for _a in _adapters if _a.identity_embedding is not None)
+                accelerator.print(f"[perceptual] Face embeddings cached for {_n_face}/{len(_adapters)} images")
+
+                if args.face_loss_weight > 0:
+                    accelerator.print("[perceptual] Loading ArcFace encoder for training...")
+                    _face_encoder = DifferentiableFaceEncoder()
+                if args.landmark_loss_weight > 0:
+                    accelerator.print("[perceptual] Loading MediaPipe landmark encoder for training...")
+                    _landmark_encoder = DifferentiableLandmarkEncoder()
+
+            # ------ Phase 3: Subject mask caching ------
+            if getattr(args, 'subject_mask_weight', 0.0) > 0:
+                from fizgig.perceptual.subject_mask import cache_subject_masks
+                _mask_cfg = SubjectMaskConfig()
+                accelerator.print("[perceptual] Caching subject masks (YOLO+SAM2+SegFormer)...")
+                cache_subject_masks(_adapters, _mask_cfg)
+                for _a in _adapters:
+                    _a.sync()
+                _n_mask = sum(1 for _a in _adapters if _a.is_mask_cached)
+                accelerator.print(f"[perceptual] Subject masks cached for {_n_mask}/{len(_adapters)} images")
+
+            # ------ Phase 4: Body proportion caching ------
+            if getattr(args, 'body_proportion_loss_weight', 0.0) > 0:
+                from fizgig.perceptual.body_id import (
+                    DifferentiableBodyProportionEncoder, cache_body_proportion_embeddings
+                )
+                if _face_cfg is None:
+                    _face_cfg = FaceIDConfig(
+                        body_proportion_loss_weight=args.body_proportion_loss_weight,
+                        body_proportion_loss_min_t=args.body_proportion_loss_min_t,
+                        body_proportion_loss_max_t=args.body_proportion_loss_max_t,
+                    )
+                else:
+                    _face_cfg.body_proportion_loss_weight = args.body_proportion_loss_weight
+                accelerator.print("[perceptual] Caching body proportion embeddings (ViTPose)...")
+                cache_body_proportion_embeddings(_adapters, _face_cfg)
+                for _a in _adapters:
+                    _a.sync()
+                _n_body = sum(1 for _a in _adapters if _a.body_proportion_embedding is not None)
+                accelerator.print(f"[perceptual] Body proportion cached for {_n_body}/{len(_adapters)} images")
+
+                accelerator.print("[perceptual] Loading ViTPose body proportion encoder for training...")
+                _body_prop_encoder = DifferentiableBodyProportionEncoder(device=accelerator.device)
+
+            del _adapters
+            accelerator.print("[perceptual] Cache pass complete.")
+
+        if _any_perceptual:
+            accelerator.wait_for_everyone()  # ensure all processes finish caching before training
+
         del train_dataset_group
 
         # ------------------------------------------------------------------
@@ -2491,6 +2634,130 @@ class KleinTrainer:
                     noise_loss = loss.mean()
 
                     loss = noise_loss
+
+                    # ----------------------------------------------------------
+                    # Perceptual auxiliary losses
+                    # ----------------------------------------------------------
+                    _apply_perceptual = (
+                        _depth_encoder is not None
+                        or _face_encoder is not None
+                        or _landmark_encoder is not None
+                        or _body_prop_encoder is not None
+                    )
+                    if _apply_perceptual:
+                        # Recover x0 latent from the flow-matching velocity prediction.
+                        # noisy_model_input = (1-t)*latents + t*noise
+                        # target             = noise - latents
+                        # model_pred        ≈ noise - latents  (the velocity)
+                        # x0_latent          = noisy_model_input - t * model_pred
+                        #
+                        # t for the primary (linear-flow) paths:
+                        #   get_noisy_model_input_and_timesteps sets timesteps = t*1000 + 1
+                        # t for the sigma-based path:
+                        #   noisy = sigma*noise + (1-sigma)*latents; same formula with sigma
+                        _PRIMARY_SAMPLINGS = {
+                            "uniform", "sigmoid", "shift", "flux_shift",
+                            "flux2_shift", "logsnr", "qinglong_flux",
+                        }
+                        if args.timestep_sampling in _PRIMARY_SAMPLINGS:
+                            _t_4d = ((timesteps - 1.0) / 1000.0).view(-1, 1, 1, 1).to(
+                                device=noisy_model_input.device, dtype=torch.float32
+                            )
+                        else:
+                            _t_4d = get_sigmas(
+                                noise_scheduler, timesteps, accelerator.device,
+                                n_dim=4, dtype=torch.float32
+                            )
+
+                        _x0_latent = (
+                            noisy_model_input.float() - _t_4d * model_pred.float()
+                        )
+
+                        # Decode to pixel space (Klein VAE: encode→normalize, decode→denormalize).
+                        # Gradients flow through x0_latent → model_pred → LoRA params.
+                        # The frozen VAE weights themselves receive no gradient.
+                        _x0_raw = vae.decode(_x0_latent.to(vae_dtype))
+                        _x0_pixels = (_x0_raw.clamp(-1.0, 1.0) + 1.0) * 0.5  # → [0, 1]
+
+                        # --- Depth consistency loss ---
+                        if _depth_encoder is not None and 'depth_gt' in batch:
+                            _t_ratio = (timesteps.float().mean() - 1.0) / 1000.0
+                            _in_t_range = (
+                                _t_ratio >= args.depth_loss_min_t
+                                and _t_ratio <= args.depth_loss_max_t
+                            )
+                            if _in_t_range:
+                                from fizgig.perceptual.depth_consistency import (
+                                    compute_depth_consistency_loss, gaussian_blur_2d
+                                )
+                                _x0_for_depth = _x0_pixels
+                                if args.depth_pixel_blur_sigma > 0:
+                                    with torch.no_grad():
+                                        _x0_for_depth = gaussian_blur_2d(
+                                            _x0_pixels, args.depth_pixel_blur_sigma
+                                        )
+                                _gt_depth = batch['depth_gt'].to(accelerator.device)
+                                _depth_mask = batch.get('subject_mask')
+                                if _depth_mask is not None:
+                                    _depth_mask = _depth_mask.to(accelerator.device)
+                                _depth_loss, _, _, _, _ = compute_depth_consistency_loss(
+                                    _depth_encoder,
+                                    _x0_for_depth,
+                                    _gt_depth,
+                                    mask=_depth_mask,
+                                    ssi_weight=args.depth_ssi_weight,
+                                    grad_weight=args.depth_grad_weight,
+                                )
+                                loss = loss + args.depth_loss_weight * _depth_loss
+
+                        # --- ArcFace identity loss ---
+                        if _face_encoder is not None and 'identity_embedding' in batch:
+                            _t_ratio = (timesteps.float().mean() - 1.0) / 1000.0
+                            _in_t_range = (
+                                _t_ratio >= args.face_loss_min_t
+                                and _t_ratio <= args.face_loss_max_t
+                            )
+                            if _in_t_range:
+                                _gt_emb = batch['identity_embedding'].to(accelerator.device)
+                                _bboxes = batch.get('face_bbox')
+                                if _bboxes is not None:
+                                    _bboxes = _bboxes.to(accelerator.device)
+                                _live_emb = _face_encoder(_x0_pixels, bboxes=_bboxes)
+                                _id_loss = (
+                                    1.0 - torch.nn.functional.cosine_similarity(
+                                        _live_emb, _gt_emb.float()
+                                    ).mean()
+                                )
+                                loss = loss + args.face_loss_weight * _id_loss
+
+                        # --- MediaPipe landmark loss ---
+                        if _landmark_encoder is not None and 'landmark_embedding' in batch:
+                            _t_ratio = (timesteps.float().mean() - 1.0) / 1000.0
+                            _in_t_range = (
+                                _t_ratio >= args.face_loss_min_t
+                                and _t_ratio <= args.face_loss_max_t
+                            )
+                            if _in_t_range:
+                                _gt_lmk = batch['landmark_embedding'].to(accelerator.device)
+                                _bboxes = batch.get('face_bbox')
+                                if _bboxes is not None:
+                                    _bboxes = _bboxes.to(accelerator.device)
+                                _live_lmk = _landmark_encoder(_x0_pixels, bboxes=_bboxes)
+                                _lmk_loss = torch.nn.functional.l1_loss(_live_lmk, _gt_lmk.float())
+                                loss = loss + args.landmark_loss_weight * _lmk_loss
+
+                        # --- ViTPose body proportion loss ---
+                        if _body_prop_encoder is not None and 'body_proportion_embedding' in batch:
+                            _t_ratio = (timesteps.float().mean() - 1.0) / 1000.0
+                            _in_t_range = (
+                                _t_ratio >= args.body_proportion_loss_min_t
+                                and _t_ratio <= args.body_proportion_loss_max_t
+                            )
+                            if _in_t_range:
+                                _gt_bp = batch['body_proportion_embedding'].to(accelerator.device)
+                                _live_bp = _body_prop_encoder(_x0_pixels)
+                                _bp_loss = torch.nn.functional.l1_loss(_live_bp, _gt_bp.float())
+                                loss = loss + args.body_proportion_loss_weight * _bp_loss
 
                     # Backward
                     accelerator.backward(loss)
@@ -3127,6 +3394,50 @@ def setup_parser() -> argparse.ArgumentParser:
     from fizgig.klein.model_utils import add_model_version_args
     add_model_version_args(parser)
 
+    # ---- Perceptual auxiliary losses ----
+    # Phase 1: Depth consistency (DA2) — most impactful, lowest overhead.
+    parser.add_argument("--depth_loss_weight", type=float, default=0.0,
+                        help="Weight for DA2 depth-consistency auxiliary loss (0 = disabled). "
+                             "Recommended starting value: 0.1–0.2. Requires --vae.")
+    parser.add_argument("--depth_da2_model_id", type=str,
+                        default="depth-anything/Depth-Anything-V2-Small-hf",
+                        help="HuggingFace model ID for Depth-Anything-V2 perceptor.")
+    parser.add_argument("--depth_ssi_weight", type=float, default=1.0,
+                        help="Scale-and-shift-invariant L1 component weight (MiDaS).")
+    parser.add_argument("--depth_grad_weight", type=float, default=0.5,
+                        help="Multi-scale gradient-matching component weight (MiDaS).")
+    parser.add_argument("--depth_loss_min_t", type=float, default=0.0,
+                        help="Min timestep ratio [0,1] at which depth loss is applied.")
+    parser.add_argument("--depth_loss_max_t", type=float, default=1.0,
+                        help="Max timestep ratio [0,1] at which depth loss is applied.")
+    parser.add_argument("--depth_pixel_blur_sigma", type=float, default=0.0,
+                        help="Pre-DA2 Gaussian blur sigma (pixels). Symmetric: applied at "
+                             "cache time AND train time so pred/GT remain comparable. 0 = off.")
+
+    # Phase 2: ArcFace identity + MediaPipe landmark loss.
+    parser.add_argument("--face_loss_weight", type=float, default=0.0,
+                        help="Weight for ArcFace cosine identity auxiliary loss (0 = disabled). "
+                             "Requires insightface + onnx2torch + onnxruntime-gpu.")
+    parser.add_argument("--landmark_loss_weight", type=float, default=0.0,
+                        help="Weight for MediaPipe FaceMesh landmark L1 loss (0 = disabled).")
+    parser.add_argument("--face_id_model", type=str, default="buffalo_l",
+                        help="InsightFace model name for ArcFace embedding extraction.")
+    parser.add_argument("--face_loss_min_t", type=float, default=0.0)
+    parser.add_argument("--face_loss_max_t", type=float, default=1.0)
+
+    # Phase 3: Subject mask (YOLO + SAM2 + SegFormer) — enhances depth/face loss.
+    parser.add_argument("--subject_mask_weight", type=float, default=0.0,
+                        help="Enable subject-mask extraction (0 = disabled). Masks are used "
+                             "to focus depth/face loss on the subject region. Requires "
+                             "ultralytics + sam2.")
+
+    # Phase 4: ViTPose body proportion loss.
+    parser.add_argument("--body_proportion_loss_weight", type=float, default=0.0,
+                        help="Weight for ViTPose bone-ratio body-proportion loss (0 = disabled). "
+                             "Requires dsntnn.")
+    parser.add_argument("--body_proportion_loss_min_t", type=float, default=0.0)
+    parser.add_argument("--body_proportion_loss_max_t", type=float, default=1.0)
+
     return parser
 
 
@@ -3142,6 +3453,20 @@ def main():
     # Klein defaults
     if args.vae_dtype is None:
         args.vae_dtype = "float32"
+
+    # Perceptual loss defaults (ensure attributes exist even when not in TOML)
+    for _attr, _default in [
+        ('depth_loss_weight', 0.0), ('depth_da2_model_id', 'depth-anything/Depth-Anything-V2-Small-hf'),
+        ('depth_ssi_weight', 1.0), ('depth_grad_weight', 0.5),
+        ('depth_loss_min_t', 0.0), ('depth_loss_max_t', 1.0), ('depth_pixel_blur_sigma', 0.0),
+        ('face_loss_weight', 0.0), ('landmark_loss_weight', 0.0),
+        ('face_id_model', 'buffalo_l'), ('face_loss_min_t', 0.0), ('face_loss_max_t', 1.0),
+        ('subject_mask_weight', 0.0),
+        ('body_proportion_loss_weight', 0.0),
+        ('body_proportion_loss_min_t', 0.0), ('body_proportion_loss_max_t', 1.0),
+    ]:
+        if not hasattr(args, _attr):
+            setattr(args, _attr, _default)
 
     trainer = KleinTrainer()
     trainer.train(args)

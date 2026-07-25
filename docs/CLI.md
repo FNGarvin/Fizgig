@@ -91,6 +91,7 @@ The two model families share the dataset format and most of the workflow, but no
 | Weight-only extraction (rank reduction, `--samples 0`) | ✅ | ✅ |
 | Profiling | ✅ full activation profile | ✅ weight-only (`--krea2`) |
 | Activation-weighted (specialized) extraction | ✅ Klein only | ❌ (needs the Klein pipeline) |
+| Perceptual auxiliary losses (depth/identity/mask/body-proportion) | ✅ | ✅ |
 
 The four intelligence toggles are Krea 2-only because auto-recaption needs a text encoder that can *see* — Krea 2's Qwen3-VL is a full vision-language model; Klein's stripped Qwen3-8B can't generate text or look at images.
 
@@ -278,6 +279,18 @@ Style genuinely lives at late timesteps (0-400) on Klein — combining the style
 
 Loads the existing LoRA frozen-but-active on the base, so your new LoRA learns to coexist with it — identity-on-style, outfit-on-character, compatibility patches. At inference, deploy the pair together at the same strength. Accepts kohya, PEFT/Diffusers, OneTrainer, LoKR and LoHa formats.
 
+**Perceptual auxiliary losses** (four independent phases, all off by default — supported on both Klein and Krea 2, same flag names on both)
+
+Each phase decodes the model's x0 prediction back to pixels mid-step and compares it against a cached ground truth, adding a differentiable auxiliary term to the flow-matching loss. Requires `--vae` (used for the x0 decode and, for depth, the GT caching round-trip too).
+
+- `--depth_loss_weight 0.1` to `0.2` — DA2 (Depth-Anything-V2) depth-consistency loss. The lowest-overhead phase and the recommended starting point; anchors overall scene/pose geometry. Tune with `--depth_ssi_weight` / `--depth_grad_weight` (MiDaS SSI-L1 + multi-scale gradient components) and gate the timestep range with `--depth_loss_min_t` / `--depth_loss_max_t`. `--depth_pixel_blur_sigma` softens both the prediction and the cached GT symmetrically before comparison.
+- `--face_loss_weight 0.1` — ArcFace cosine identity loss (`--face_id_model`, default `buffalo_l`). Requires `insightface` + `onnx2torch` + `onnxruntime-gpu`.
+- `--landmark_loss_weight 0.05` — MediaPipe FaceMesh V2 landmark L1 loss (478-point face shape). Shares `--face_loss_min_t` / `--face_loss_max_t` with the identity loss.
+- `--subject_mask_weight 1.0` — enables YOLO + SAM2 + SegFormer subject-mask caching, which focuses the depth loss on the subject region once cached (requires `ultralytics`; SAM2/SegFormer come via `transformers`). Not itself a loss term — it sharpens depth.
+- `--body_proportion_loss_weight 0.05` — ViTPose bone-length-ratio loss (8 ratios), anchors limb proportions against distortion. Requires `dsntnn`. Gate with `--body_proportion_loss_min_t` / `--body_proportion_loss_max_t`.
+
+The first training run with any of these enabled pays a one-time GT-caching pass (depth maps / face embeddings / masks / body-proportion ratios) before the epoch loop starts; subsequent runs over the same dataset hit the cache. Start with depth alone at a low weight before layering on the others.
+
 **Checkpoints / state**
 
 - `--save_every_n_epochs 1` + `--save_state` — per-epoch LoRA checkpoints plus resumable state dirs (`<name>-NNNNNN-state/`). State is what makes pause/resume and epoch-scrubbing possible; keep it on.
@@ -357,6 +370,8 @@ Persistent artifacts: exclusions are stored in `<image_directory>/fizgig_exclude
 - `--lr_scheduler` — `constant` (default), `constant_with_warmup`, `cosine`, `cosine_with_restarts`, `linear`, `polynomial`; with `--lr_warmup_steps` (plus `--lr_scheduler_num_cycles` / `--lr_scheduler_power` for the two that use them). **Ignored when `--adaptive_lr` is on** — the plateau watcher owns the LR and says so in the log. Resume continues the curve rather than restarting it.
 - `--gradient_accumulation_steps N` — accumulate over N micro-batches per optimizer step (effective batch = N). The loss is averaged over the group, and a partial group is flushed at the epoch boundary. Per-image LR still applies per image.
 - `--max_grad_norm` — gradient clipping (default 1.0, matching the reference recipe; 0 disables).
+
+**Perceptual auxiliary losses** — the same four phases and flag names as [Klein](#klein-9b-training) (`--depth_loss_weight`, `--face_loss_weight`, `--landmark_loss_weight`, `--subject_mask_weight`, `--body_proportion_loss_weight`, plus their `*_min_t`/`*_max_t`/model-id knobs). `--vae` is required whenever any of these are non-zero, even if you're not sampling previews — Krea 2 normally only loads the VAE on-demand for Turbo previews, but a perceptual loss needs it resident for every training step's x0 decode (and, for depth, the one-time GT-caching round-trip), so budget the extra VRAM alongside the resident fp8/NF4 DiT.
 
 **Not in the Krea 2 parser (by design):** optimizer choice (AdamW8bit hardcoded), timestep sampling (fixed `krea2_shift` recipe), block targeting (no Krea 2 block map yet), gradient checkpointing (always on). What's absent is deliberate, not missing.
 

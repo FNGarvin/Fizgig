@@ -75,6 +75,38 @@ def setup_parser() -> argparse.ArgumentParser:
                         "(reads <dataset>/fizgig_look_scores.json from the Image Prep Look Filter)")
     p.add_argument("--trigger_word", default=None,
                    help="Trigger word appended (', <trigger>') to auto-generated captions")
+
+    # ---- Perceptual auxiliary losses (same four phases as Klein) ----
+    p.add_argument("--depth_loss_weight", type=float, default=0.0,
+                   help="Weight for DA2 depth-consistency auxiliary loss (0 = disabled). "
+                        "Recommended starting value: 0.1-0.2. Requires --vae.")
+    p.add_argument("--depth_da2_model_id", type=str, default="depth-anything/Depth-Anything-V2-Small-hf",
+                   help="HuggingFace model ID for Depth-Anything-V2 perceptor.")
+    p.add_argument("--depth_ssi_weight", type=float, default=1.0,
+                   help="Scale-and-shift-invariant L1 component weight (MiDaS).")
+    p.add_argument("--depth_grad_weight", type=float, default=0.5,
+                   help="Multi-scale gradient-matching component weight (MiDaS).")
+    p.add_argument("--depth_loss_min_t", type=float, default=0.0,
+                   help="Min timestep ratio [0,1] at which depth loss is applied.")
+    p.add_argument("--depth_loss_max_t", type=float, default=1.0,
+                   help="Max timestep ratio [0,1] at which depth loss is applied.")
+    p.add_argument("--depth_pixel_blur_sigma", type=float, default=0.0,
+                   help="Pre-DA2 Gaussian blur sigma (pixels). 0 = off.")
+    p.add_argument("--face_loss_weight", type=float, default=0.0,
+                   help="Weight for ArcFace cosine identity auxiliary loss (0 = disabled). "
+                        "Requires insightface + onnx2torch + onnxruntime-gpu.")
+    p.add_argument("--landmark_loss_weight", type=float, default=0.0,
+                   help="Weight for MediaPipe FaceMesh landmark L1 loss (0 = disabled).")
+    p.add_argument("--face_id_model", type=str, default="buffalo_l",
+                   help="InsightFace model name for ArcFace embedding extraction.")
+    p.add_argument("--face_loss_min_t", type=float, default=0.0)
+    p.add_argument("--face_loss_max_t", type=float, default=1.0)
+    p.add_argument("--subject_mask_weight", type=float, default=0.0,
+                   help="Enable subject-mask extraction (0 = disabled). Requires ultralytics + sam2.")
+    p.add_argument("--body_proportion_loss_weight", type=float, default=0.0,
+                   help="Weight for ViTPose bone-ratio body-proportion loss (0 = disabled). Requires dsntnn.")
+    p.add_argument("--body_proportion_loss_min_t", type=float, default=0.0)
+    p.add_argument("--body_proportion_loss_max_t", type=float, default=1.0)
     return p
 
 
@@ -118,6 +150,22 @@ def main():
         auto_recaption=args.auto_recaption,
         warmup_look_outliers=args.warmup_look_outliers,
         trigger_word=args.trigger_word,
+        depth_loss_weight=args.depth_loss_weight,
+        depth_da2_model_id=args.depth_da2_model_id,
+        depth_ssi_weight=args.depth_ssi_weight,
+        depth_grad_weight=args.depth_grad_weight,
+        depth_loss_min_t=args.depth_loss_min_t,
+        depth_loss_max_t=args.depth_loss_max_t,
+        depth_pixel_blur_sigma=args.depth_pixel_blur_sigma,
+        face_loss_weight=args.face_loss_weight,
+        landmark_loss_weight=args.landmark_loss_weight,
+        face_id_model=args.face_id_model,
+        face_loss_min_t=args.face_loss_min_t,
+        face_loss_max_t=args.face_loss_max_t,
+        subject_mask_weight=args.subject_mask_weight,
+        body_proportion_loss_weight=args.body_proportion_loss_weight,
+        body_proportion_loss_min_t=args.body_proportion_loss_min_t,
+        body_proportion_loss_max_t=args.body_proportion_loss_max_t,
     )
 
 

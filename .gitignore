@@ -4,6 +4,9 @@ CLAUDE.md
 # Virtual environment
 venv/
 
+# Local model weights (test copies — the real files live outside the repo)
+models/
+
 # Python cache
 __pycache__/
 *.pyc

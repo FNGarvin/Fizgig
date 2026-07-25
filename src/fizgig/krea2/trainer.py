@@ -149,12 +149,38 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
     return (t * shift) / (1.0 + (shift - 1.0) * t)
 
 
-def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16):
+class Krea2PerceptualContext:
+    """Bundles the loaded perceptual-loss encoders + VAE + loss args for compute_loss.
+
+    A None encoder means that loss phase is disabled — mirrors KleinTrainer's None-encoder
+    gating in src/fizgig/training/trainer.py. `args` carries the *_loss_weight / *_min_t / *_max_t
+    values (same attribute names as Klein's argparse flags)."""
+
+    def __init__(self, args, vae=None, depth_encoder=None, face_encoder=None,
+                 landmark_encoder=None, body_prop_encoder=None):
+        self.args = args
+        self.vae = vae
+        self.depth_encoder = depth_encoder
+        self.face_encoder = face_encoder
+        self.landmark_encoder = landmark_encoder
+        self.body_prop_encoder = body_prop_encoder
+
+    @property
+    def active(self) -> bool:
+        return any([self.depth_encoder, self.face_encoder, self.landmark_encoder, self.body_prop_encoder])
+
+
+def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
+                  batch=None, perceptual: "Krea2PerceptualContext" = None):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
     hidden_states: (B, seq, layers, dim) — cached Qwen3-VL multi-layer stack
     attention_mask:(B, seq) bool         — cached validity mask
+    batch:         the full collated batch dict (only used for perceptual sidecar keys —
+                   depth_gt / subject_mask / identity_embedding / face_bbox /
+                   landmark_embedding / body_proportion_embedding — when `perceptual` is active)
+    perceptual:    optional Krea2PerceptualContext; None or .active=False skips all of this
 
     `shift` is kept for signature compatibility but no longer used: krea2_shift derives the flow
     shift from the image resolution (see sample_krea2_timesteps), matching the musubi reference.
@@ -180,9 +206,89 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
 
     with torch.autocast(device_type=torch.device(device).type, dtype=dtype):
         pred = dit(img=img_tokens, context=txt, t=t.to(dtype), pos=pos, mask=mask)
+
+    loss = F.mse_loss(pred.float(), target_tokens.float())
+
+    # ------------------------------------------------------------------
+    # Perceptual auxiliary losses (depth / identity / landmark / body-proportion)
+    # ------------------------------------------------------------------
+    if perceptual is not None and perceptual.active and batch is not None:
+        pa = perceptual.args
+        # t is already a plain [0,1] fraction here (unlike Klein's timesteps = t*1000+1), so the
+        # ratio used for the min/max-t gates is just the mean of t itself.
+        _t_ratio = float(t.mean().item())
+
+        # x0 recovery in Krea2's PATCHIFIED token space: img_tokens is the patchified `noised`
+        # latent, pred is the predicted velocity in the same token layout (see prepare() in
+        # krea2/sampling.py). x0_tokens = noised_tokens - t*pred, mirroring Klein's spatial
+        # x0_latent = noisy_model_input - t*model_pred, just before unpatchify+decode instead of
+        # a direct vae.decode() (Klein never needs the unpatchify step).
+        t_tok = t.view(B, 1, 1).float()
+        x0_tokens = img_tokens.float() - t_tok * pred.float()
+        h_ = latent.shape[-2] // patch
+        w_ = latent.shape[-1] // patch
+        from einops import rearrange
+        x0_latent = rearrange(
+            x0_tokens, "b (h w) (c ph pw) -> b c 1 (h ph) (w pw)",
+            ph=patch, pw=patch, h=h_, w=w_,
+        )
+        # decode_to_pixels denormalizes (latents/std + mean), decodes, drops the frame axis, and
+        # returns [0, 1] — the same convention as Klein's ad-hoc (x0_raw.clamp(-1,1)+1)*0.5.
+        x0_pixels = perceptual.vae.decode_to_pixels(x0_latent)
+
+        # --- Depth consistency loss ---
+        if perceptual.depth_encoder is not None and 'depth_gt' in batch:
+            if pa.depth_loss_min_t <= _t_ratio <= pa.depth_loss_max_t:
+                from fizgig.perceptual.depth_consistency import (
+                    compute_depth_consistency_loss, gaussian_blur_2d
+                )
+                _x0_for_depth = x0_pixels
+                if pa.depth_pixel_blur_sigma > 0:
+                    with torch.no_grad():
+                        _x0_for_depth = gaussian_blur_2d(x0_pixels, pa.depth_pixel_blur_sigma)
+                _gt_depth = batch['depth_gt'].to(device)
+                _depth_mask = batch.get('subject_mask')
+                if _depth_mask is not None:
+                    _depth_mask = _depth_mask.to(device)
+                _depth_loss, _, _, _, _ = compute_depth_consistency_loss(
+                    perceptual.depth_encoder, _x0_for_depth, _gt_depth,
+                    mask=_depth_mask, ssi_weight=pa.depth_ssi_weight, grad_weight=pa.depth_grad_weight,
+                )
+                loss = loss + pa.depth_loss_weight * _depth_loss
+
+        # --- ArcFace identity loss ---
+        if perceptual.face_encoder is not None and 'identity_embedding' in batch:
+            if pa.face_loss_min_t <= _t_ratio <= pa.face_loss_max_t:
+                _gt_emb = batch['identity_embedding'].to(device)
+                _bboxes = batch.get('face_bbox')
+                if _bboxes is not None:
+                    _bboxes = _bboxes.to(device)
+                _live_emb = perceptual.face_encoder(x0_pixels, bboxes=_bboxes)
+                _id_loss = 1.0 - F.cosine_similarity(_live_emb, _gt_emb.float()).mean()
+                loss = loss + pa.face_loss_weight * _id_loss
+
+        # --- MediaPipe landmark loss ---
+        if perceptual.landmark_encoder is not None and 'landmark_embedding' in batch:
+            if pa.face_loss_min_t <= _t_ratio <= pa.face_loss_max_t:
+                _gt_lmk = batch['landmark_embedding'].to(device)
+                _bboxes = batch.get('face_bbox')
+                if _bboxes is not None:
+                    _bboxes = _bboxes.to(device)
+                _live_lmk = perceptual.landmark_encoder(x0_pixels, bboxes=_bboxes)
+                _lmk_loss = F.l1_loss(_live_lmk, _gt_lmk.float())
+                loss = loss + pa.landmark_loss_weight * _lmk_loss
+
+        # --- ViTPose body proportion loss ---
+        if perceptual.body_prop_encoder is not None and 'body_proportion_embedding' in batch:
+            if pa.body_proportion_loss_min_t <= _t_ratio <= pa.body_proportion_loss_max_t:
+                _gt_bp = batch['body_proportion_embedding'].to(device)
+                _live_bp = perceptual.body_prop_encoder(x0_pixels)
+                _bp_loss = F.l1_loss(_live_bp, _gt_bp.float())
+                loss = loss + pa.body_proportion_loss_weight * _bp_loss
+
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
     # normalize for noise level (the caller ignores it when logging is off).
-    return F.mse_loss(pred.float(), target_tokens.float()), float(t.mean().item())
+    return loss, float(t.mean().item())
 
 
 class _Krea2Collator:
@@ -819,6 +925,24 @@ def train_krea2(
     adaptive_lr: bool = False,
     adaptive_lr_min: float = 1e-5,
     adaptive_lr_max: float = 4e-4,
+    # Perceptual auxiliary losses (depth / identity / landmark / body-proportion — same four
+    # phases and flag names as Klein's src/fizgig/training/trainer.py). All 0.0 = disabled.
+    depth_loss_weight: float = 0.0,
+    depth_da2_model_id: str = "depth-anything/Depth-Anything-V2-Small-hf",
+    depth_ssi_weight: float = 1.0,
+    depth_grad_weight: float = 0.5,
+    depth_loss_min_t: float = 0.0,
+    depth_loss_max_t: float = 1.0,
+    depth_pixel_blur_sigma: float = 0.0,
+    face_loss_weight: float = 0.0,
+    landmark_loss_weight: float = 0.0,
+    face_id_model: str = "buffalo_l",
+    face_loss_min_t: float = 0.0,
+    face_loss_max_t: float = 1.0,
+    subject_mask_weight: float = 0.0,
+    body_proportion_loss_weight: float = 0.0,
+    body_proportion_loss_min_t: float = 0.0,
+    body_proportion_loss_max_t: float = 1.0,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -836,6 +960,140 @@ def train_krea2(
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
+
+    # ------------------------------------------------------------------
+    # Perceptual auxiliary losses — cache pass + encoder setup
+    # ------------------------------------------------------------------
+    _any_perceptual = (
+        depth_loss_weight > 0 or face_loss_weight > 0 or landmark_loss_weight > 0
+        or subject_mask_weight > 0 or body_proportion_loss_weight > 0
+    )
+    perceptual_ctx = None
+    if _any_perceptual:
+        if not vae_path:
+            raise ValueError(
+                "Perceptual auxiliary losses require --vae (needed for x0 decode + GT depth caching)."
+            )
+        from fizgig.krea2.vae_loader import load_vae as _load_krea2_vae
+        logger.info("[perceptual] Loading Qwen-Image VAE for x0 decode and GT caching...")
+        perceptual_vae = _load_krea2_vae(vae_path, input_channels=3, device=device, disable_mmap=True)
+        perceptual_vae.requires_grad_(False)
+        perceptual_vae.eval()
+
+        from fizgig.perceptual.adapter import build_perceptual_adapters
+        from fizgig.perceptual.config import DepthConsistencyConfig, FaceIDConfig, SubjectMaskConfig
+
+        logger.info("[perceptual] Building dataset adapters...")
+        _adapters = build_perceptual_adapters(group)
+        logger.info(f"[perceptual] {len(_adapters)} unique (image, bucket) pairs")
+
+        _depth_encoder = _face_encoder = _landmark_encoder = _body_prop_encoder = None
+
+        # ------ Phase 1: Depth GT caching ------
+        if depth_loss_weight > 0:
+            from fizgig.perceptual.depth_consistency import (
+                DifferentiableDepthEncoder, cache_depth_gt_embeddings
+            )
+            _depth_cfg = DepthConsistencyConfig(
+                model_id=depth_da2_model_id, ssi_weight=depth_ssi_weight, grad_weight=depth_grad_weight,
+                pixel_blur_sigma=depth_pixel_blur_sigma,
+                loss_min_t=depth_loss_min_t, loss_max_t=depth_loss_max_t,
+            )
+
+            def _vae_roundtrip(pixels):
+                """pixels: (1, 3, H, W) in [0, 1] -> decoded (1, 3, H, W) in [0, 1]. Krea2Vae's
+                encode_pixels_to_latents/decode_to_pixels already take/return [0,1] pixels and
+                handle the mean/std latent normalization internally — no manual *2-1 needed."""
+                with torch.no_grad():
+                    z = perceptual_vae.encode_pixels_to_latents(pixels.to(dtype))
+                    return perceptual_vae.decode_to_pixels(z)
+
+            logger.info("[perceptual] Caching GT depth maps (VAE-roundtrip)...")
+            cache_depth_gt_embeddings(_adapters, _depth_cfg, device=device, vae_roundtrip_fn=_vae_roundtrip)
+            for _a in _adapters:
+                _a.sync()
+            _n_depth = sum(1 for _a in _adapters if _a.is_depth_cached)
+            logger.info(f"[perceptual] Depth GT cached for {_n_depth}/{len(_adapters)} images")
+            logger.info("[perceptual] Loading DA2 depth encoder for training...")
+            _depth_encoder = DifferentiableDepthEncoder(
+                model_id=depth_da2_model_id, dtype=dtype, device=device, grad_checkpoint=True,
+            )
+
+        # ------ Phase 2: Face identity + landmark caching ------
+        _face_cfg = None
+        if face_loss_weight > 0 or landmark_loss_weight > 0:
+            from fizgig.perceptual.face_id import (
+                DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
+            )
+            _face_cfg = FaceIDConfig(
+                face_model=face_id_model, identity_loss_weight=face_loss_weight,
+                landmark_loss_weight=landmark_loss_weight,
+                identity_loss_min_t=face_loss_min_t, identity_loss_max_t=face_loss_max_t,
+            )
+            logger.info("[perceptual] Caching face embeddings...")
+            cache_face_embeddings(_adapters, _face_cfg)
+            for _a in _adapters:
+                _a.sync()
+            _n_face = sum(1 for _a in _adapters if _a.identity_embedding is not None)
+            logger.info(f"[perceptual] Face embeddings cached for {_n_face}/{len(_adapters)} images")
+            if face_loss_weight > 0:
+                logger.info("[perceptual] Loading ArcFace encoder for training...")
+                _face_encoder = DifferentiableFaceEncoder()
+            if landmark_loss_weight > 0:
+                logger.info("[perceptual] Loading MediaPipe landmark encoder for training...")
+                _landmark_encoder = DifferentiableLandmarkEncoder()
+
+        # ------ Phase 3: Subject mask caching ------
+        if subject_mask_weight > 0:
+            from fizgig.perceptual.subject_mask import cache_subject_masks
+            _mask_cfg = SubjectMaskConfig()
+            logger.info("[perceptual] Caching subject masks (YOLO+SAM2+SegFormer)...")
+            cache_subject_masks(_adapters, _mask_cfg)
+            for _a in _adapters:
+                _a.sync()
+            _n_mask = sum(1 for _a in _adapters if _a.is_mask_cached)
+            logger.info(f"[perceptual] Subject masks cached for {_n_mask}/{len(_adapters)} images")
+
+        # ------ Phase 4: Body proportion caching ------
+        if body_proportion_loss_weight > 0:
+            from fizgig.perceptual.body_id import (
+                DifferentiableBodyProportionEncoder, cache_body_proportion_embeddings
+            )
+            if _face_cfg is None:
+                _face_cfg = FaceIDConfig(
+                    body_proportion_loss_weight=body_proportion_loss_weight,
+                    body_proportion_loss_min_t=body_proportion_loss_min_t,
+                    body_proportion_loss_max_t=body_proportion_loss_max_t,
+                )
+            else:
+                _face_cfg.body_proportion_loss_weight = body_proportion_loss_weight
+            logger.info("[perceptual] Caching body proportion embeddings (ViTPose)...")
+            cache_body_proportion_embeddings(_adapters, _face_cfg)
+            for _a in _adapters:
+                _a.sync()
+            _n_body = sum(1 for _a in _adapters if _a.body_proportion_embedding is not None)
+            logger.info(f"[perceptual] Body proportion cached for {_n_body}/{len(_adapters)} images")
+            logger.info("[perceptual] Loading ViTPose body proportion encoder for training...")
+            _body_prop_encoder = DifferentiableBodyProportionEncoder(device=device)
+
+        del _adapters
+        logger.info("[perceptual] Cache pass complete.")
+
+        perceptual_args = argparse.Namespace(
+            depth_loss_weight=depth_loss_weight, depth_ssi_weight=depth_ssi_weight,
+            depth_grad_weight=depth_grad_weight, depth_pixel_blur_sigma=depth_pixel_blur_sigma,
+            depth_loss_min_t=depth_loss_min_t, depth_loss_max_t=depth_loss_max_t,
+            face_loss_weight=face_loss_weight, face_loss_min_t=face_loss_min_t, face_loss_max_t=face_loss_max_t,
+            landmark_loss_weight=landmark_loss_weight,
+            body_proportion_loss_weight=body_proportion_loss_weight,
+            body_proportion_loss_min_t=body_proportion_loss_min_t,
+            body_proportion_loss_max_t=body_proportion_loss_max_t,
+        )
+        perceptual_ctx = Krea2PerceptualContext(
+            perceptual_args, vae=perceptual_vae,
+            depth_encoder=_depth_encoder, face_encoder=_face_encoder,
+            landmark_encoder=_landmark_encoder, body_prop_encoder=_body_prop_encoder,
+        )
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.
@@ -1109,7 +1367,7 @@ def train_krea2(
                 progress_bar.update(1)
                 continue
             loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
-                                        shift=shift, dtype=dtype)
+                                        shift=shift, dtype=dtype, batch=batch, perceptual=perceptual_ctx)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.

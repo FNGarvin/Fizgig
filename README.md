@@ -282,8 +282,8 @@ If Fizgig saves you time or helps you make better LoRAs, consider supporting dev
 
 ## License
 
-Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to use, modify, and redistribute, including commercially, with attribution and no warranty. It includes third-party components under compatible permissive licenses (musubi-tuner — Apache-2.0; ai-toolkit — MIT; Diffusers / FLUX — Apache-2.0); see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
+Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to use, modify, and redistribute, including commercially, with attribution and no warranty. Copyright © 2026 Peter Neill. It includes third-party components under compatible permissive licenses (musubi-tuner — Apache-2.0; ai-toolkit — MIT; Diffusers / FLUX — Apache-2.0); see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
 
-Copyright © 2026 Peter Neill.
+Fizgig is built atop of and redistributes various Open Source platforms and libraries including Python, Torch, and Transformers.  The code for the perceptual auxiliary losses (depth, identity, mask, body proportion) was based on the work in [ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) licensed under the [MIT permissive license](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual?tab=MIT-1-ov-file#readme).
 
 Model weights are **not** covered by this license — each model carries its own terms from its publisher (see the Download links in Preferences).
