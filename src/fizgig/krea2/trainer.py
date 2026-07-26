@@ -1051,10 +1051,10 @@ def train_krea2(
             logger.info(f"[perceptual] Face embeddings cached for {_n_face}/{len(_adapters)} images")
             if face_loss_weight > 0:
                 logger.info("[perceptual] Loading ArcFace encoder for training...")
-                _face_encoder = DifferentiableFaceEncoder()
+                _face_encoder = DifferentiableFaceEncoder().to(device)
             if landmark_loss_weight > 0:
                 logger.info("[perceptual] Loading MediaPipe landmark encoder for training...")
-                _landmark_encoder = DifferentiableLandmarkEncoder()
+                _landmark_encoder = DifferentiableLandmarkEncoder().to(device)
 
         # ------ Phase 3: Subject mask caching ------
         if subject_mask_weight > 0:

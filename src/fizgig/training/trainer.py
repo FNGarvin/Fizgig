@@ -2378,10 +2378,10 @@ class KleinTrainer:
 
                 if args.face_loss_weight > 0:
                     accelerator.print("[perceptual] Loading ArcFace encoder for training...")
-                    _face_encoder = DifferentiableFaceEncoder()
+                    _face_encoder = DifferentiableFaceEncoder().to(accelerator.device)
                 if args.landmark_loss_weight > 0:
                     accelerator.print("[perceptual] Loading MediaPipe landmark encoder for training...")
-                    _landmark_encoder = DifferentiableLandmarkEncoder()
+                    _landmark_encoder = DifferentiableLandmarkEncoder().to(accelerator.device)
 
             # ------ Phase 3: Subject mask caching ------
             if getattr(args, 'subject_mask_weight', 0.0) > 0:
