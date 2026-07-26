@@ -95,17 +95,26 @@ class FaceIDConfig:
 
 
 class SubjectMaskConfig:
-    """Auto-masking via YOLO + SAM 2 + SegFormer-clothes."""
+    """Auto-masking via YOLO + SAM 2 + SegFormer-clothes.
+
+    Field names/defaults mirror current ai-toolkit-perceptual (as of the fresh
+    subject_mask.py re-port) — the previous version of this class dated from
+    the original port and had drifted (different names entirely: yolo_model/
+    sam2_model/segformer_model/mask_blur_sigma/person_confidence/expand_ratio/
+    body_mask_clothes), which subject_mask.py's cache_subject_masks() no
+    longer reads at all.
+    """
 
     def __init__(self, **kwargs):
-        self.enabled: bool = kwargs.get('enabled', True)
-        self.yolo_model: str = kwargs.get('yolo_model', 'yolo11x.pt')
-        self.sam2_model: str = kwargs.get('sam2_model', 'facebook/sam2-hiera-large')
-        self.segformer_model: str = kwargs.get('segformer_model', 'mattmdjaga/segformer_b2_clothes')
-        self.mask_blur_sigma: float = kwargs.get('mask_blur_sigma', 3.0)
-        self.person_confidence: float = kwargs.get('person_confidence', 0.5)
-        self.expand_ratio: float = kwargs.get('expand_ratio', 0.1)
-        self.body_mask_clothes: bool = kwargs.get('body_mask_clothes', True)
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
+        self.yolo_conf: float = kwargs.get('yolo_conf', 0.25)
+        self.primary_only: bool = kwargs.get('primary_only', True)
+        self.sam_size: str = kwargs.get('sam_size', 'small')
+        self.segformer_res: int = kwargs.get('segformer_res', 768)
+        self.cache_resolution: int = kwargs.get('cache_resolution', 256)
+        self.dtype: str = kwargs.get('dtype', 'fp16')
+        self.body_close_radius: int = kwargs.get('body_close_radius', 2)
 
 
 class BodyIDConfig:
