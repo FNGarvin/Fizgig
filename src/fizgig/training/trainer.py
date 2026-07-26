@@ -2391,7 +2391,7 @@ class KleinTrainer:
                 cache_subject_masks(_adapters, _mask_cfg)
                 for _a in _adapters:
                     _a.sync()
-                _n_mask = sum(1 for _a in _adapters if _a.is_mask_cached)
+                _n_mask = sum(1 for _a in _adapters if _a.subject_mask is not None)
                 accelerator.print(f"[perceptual] Subject masks cached for {_n_mask}/{len(_adapters)} images")
 
             # ------ Phase 4: Body proportion caching ------

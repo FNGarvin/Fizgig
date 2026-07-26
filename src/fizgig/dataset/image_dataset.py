@@ -463,15 +463,11 @@ class BucketBatchManager:
                 except Exception:
                     pass
 
-            # Subject mask (stored alongside depth in the same sidecar)
-            if getattr(item_info, 'is_mask_cached', False):
-                try:
-                    from safetensors.torch import load_file as _sf_load2
-                    _m = _sf_load2(item_info._mask_cache_path)
-                    if 'subject_mask' in _m:
-                        _mask_tensors.append(_m['subject_mask'])
-                except Exception:
-                    pass
+            # Subject mask — cache_subject_masks() sets this in-memory on the
+            # adapter/ItemInfo directly (not a lazy-load sidecar like depth_gt).
+            _sm = getattr(item_info, 'subject_mask', None)
+            if _sm is not None:
+                _mask_tensors.append(_sm)
 
             # In-memory perceptual embeddings
             _ie = getattr(item_info, 'identity_embedding', None)

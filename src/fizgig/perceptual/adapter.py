@@ -107,7 +107,16 @@ class PerceptualAdapter:
         if self.landmark_embedding is not None:
             ii.landmark_embedding = self.landmark_embedding
 
-        # Subject mask — lazy loading from sidecar
+        # Subject mask — cache_subject_masks() sets these directly on the adapter
+        # (it's passed the adapter list as its "file_items"), never the
+        # _mask_cache_path/is_mask_cached pair below — those are legacy/unused by
+        # the current cache_subject_masks(), kept only so stale readers don't KeyError.
+        if self.subject_mask is not None:
+            ii.subject_mask = self.subject_mask
+        if self.body_mask is not None:
+            ii.body_mask = self.body_mask
+        if self.clothing_mask is not None:
+            ii.clothing_mask = self.clothing_mask
         ii._mask_cache_path = self._mask_cache_path
         ii.is_mask_cached = self.is_mask_cached
 
