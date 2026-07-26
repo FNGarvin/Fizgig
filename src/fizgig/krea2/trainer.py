@@ -393,6 +393,12 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
         # decode_to_pixels denormalizes (latents/std + mean), decodes, drops the frame axis, and
         # returns [0, 1] — the same convention as Klein's ad-hoc (x0_raw.clamp(-1,1)+1)*0.5.
         x0_pixels = perceptual.vae.decode_to_pixels(x0_latent)
+        # ArcFace (onnx2torch-converted)/MediaPipe/ViTPose all default to float32 weights —
+        # unlike DifferentiableDepthEncoder, they take no dtype arg at construction, so they
+        # never got cast to bf16. Klein never hits this because its x0_pixels is already
+        # float32; Krea2's decode_to_pixels returns bf16 (matching the training dtype), so
+        # these three specifically need an explicit float32 copy.
+        x0_pixels_f32 = x0_pixels.float()
 
         # --- Depth consistency loss ---
         if perceptual.depth_encoder is not None and 'depth_gt' in batch:
@@ -421,7 +427,7 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
                 _bboxes = batch.get('face_bbox')
                 if _bboxes is not None:
                     _bboxes = _bboxes.to(device)
-                _live_emb = perceptual.face_encoder(x0_pixels, bboxes=_bboxes)
+                _live_emb = perceptual.face_encoder(x0_pixels_f32, bboxes=_bboxes)
                 _id_loss = 1.0 - F.cosine_similarity(_live_emb, _gt_emb.float()).mean()
                 loss = loss + pa.face_loss_weight * _id_loss
 
@@ -432,7 +438,7 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
                 _bboxes = batch.get('face_bbox')
                 if _bboxes is not None:
                     _bboxes = _bboxes.to(device)
-                _live_lmk = perceptual.landmark_encoder(x0_pixels, bboxes=_bboxes)
+                _live_lmk = perceptual.landmark_encoder(x0_pixels_f32, bboxes=_bboxes)
                 _lmk_loss = F.l1_loss(_live_lmk, _gt_lmk.float())
                 loss = loss + pa.landmark_loss_weight * _lmk_loss
 
@@ -445,7 +451,7 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
                 # from ai-toolkit-perceptual's SDTrainer._need_body_proportion_loss).
                 _bp_n = _gt_bp.shape[-1] // 2
                 _ref_ratios, _ref_vis = _gt_bp[:, :_bp_n], _gt_bp[:, _bp_n:]
-                _gen_ratios, _gen_vis = perceptual.body_prop_encoder(x0_pixels)
+                _gen_ratios, _gen_vis = perceptual.body_prop_encoder(x0_pixels_f32)
                 _combined_vis = torch.min(_ref_vis, _gen_vis)
                 _weighted_diff = (_gen_ratios - _ref_ratios).abs() * _combined_vis
                 _bp_loss_per_sample = (
