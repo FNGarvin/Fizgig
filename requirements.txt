@@ -39,7 +39,7 @@ huggingface-hub==0.34.3
 
 # Face detection (for data preparation + ArcFace identity loss)
 insightface>=0.7.0
-onnxruntime-gpu>=1.15.0  # plain onnxruntime silently runs InsightFace on CPU (~330x slower) even with a GPU present
+onnxruntime-gpu>=1.15.0,<1.21  # plain onnxruntime silently runs InsightFace on CPU (~330x slower) even with a GPU present. >=1.21 defaults to a CUDA 13 runtime (libcudart.so.13) that CUDA-12.x hosts don't have.
 
 # AI Captioning (Florence-2)
 timm>=0.9.0
