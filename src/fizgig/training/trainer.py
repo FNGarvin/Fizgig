@@ -2415,7 +2415,7 @@ class KleinTrainer:
                 accelerator.print(f"[perceptual] Body proportion cached for {_n_body}/{len(_adapters)} images")
 
                 accelerator.print("[perceptual] Loading ViTPose body proportion encoder for training...")
-                _body_prop_encoder = DifferentiableBodyProportionEncoder(device=accelerator.device)
+                _body_prop_encoder = DifferentiableBodyProportionEncoder().to(accelerator.device)
 
             del _adapters
             accelerator.print("[perceptual] Cache pass complete.")

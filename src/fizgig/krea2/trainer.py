@@ -1074,7 +1074,7 @@ def train_krea2(
             _n_body = sum(1 for _a in _adapters if _a.body_proportion_embedding is not None)
             logger.info(f"[perceptual] Body proportion cached for {_n_body}/{len(_adapters)} images")
             logger.info("[perceptual] Loading ViTPose body proportion encoder for training...")
-            _body_prop_encoder = DifferentiableBodyProportionEncoder(device=device)
+            _body_prop_encoder = DifferentiableBodyProportionEncoder().to(device)
 
         del _adapters
         logger.info("[perceptual] Cache pass complete.")
