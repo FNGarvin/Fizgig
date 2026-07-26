@@ -14,6 +14,7 @@ import math
 import os
 import random
 import sys
+import time
 from multiprocessing import Value
 
 from tqdm import tqdm
@@ -30,6 +31,7 @@ from fizgig.dataset.config import (
 )
 from fizgig.krea2.utils import load_krea2_dit
 from fizgig.krea2.sampling import gather_valid_text, prepare
+from fizgig.modules.sdpa import consider_training_backend as _consider_training_backend
 from fizgig.networks.lora import create_network
 from fizgig.training.metadata import ARCHITECTURE_KREA2
 from fizgig.training.train_utils import LossRecorder
@@ -63,8 +65,10 @@ def load_dit_for_training(
     network_alpha: float = 32,
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
+    quant_int8: str = "",          # "" | "bf16" | "int8" — W8A8 base, grad_mode of the same name
     blocks_to_swap: int = 0,
     gradient_checkpointing: bool = True,
+    compile_blocks: bool = False,   # resolved by the caller; load_dit_ takes a plain bool
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
     device: str = "cuda",
@@ -79,7 +83,12 @@ def load_dit_for_training(
     swap (weights live in _nf4_packed, not .weight). Loads the base bf16 on CPU and NF4-quantizes
     the block Linears onto the GPU layer-by-layer (peak VRAM never holds the whole bf16 model).
     Reuses the same target/exclude keys as the fp8 path (`blocks.` minus mod./norm/txtfusion)."""
-    if quant_4bit:
+    if quant_int8:
+        # INT8 W8A8: quantize from bf16 like NF4 (avoids fp8->int8 double-quant).
+        fp8_scaled = False
+        quant_4bit = False
+        loading_device = "cpu"
+    elif quant_4bit:
         # NF4 quantizes from bf16 (cleaner than fp8->NF4 double-quant), staged on CPU, and can't
         # coexist with block swap — force both here so callers can't misconfigure it.
         fp8_scaled = False
@@ -90,6 +99,18 @@ def load_dit_for_training(
     dit = load_krea2_dit(raw_path, device=device, dtype=dtype, fp8_scaled=fp8_scaled,
                          loading_device=loading_device)
     dit.requires_grad_(False)  # frozen base (QLoRA-style)
+    if quant_int8:
+        from fizgig.krea2.utils import KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS
+        from fizgig.modules.int8_train import apply_int8_training
+        n_q = apply_int8_training(
+            dit, target_keys=KREA2_FP8_OPTIMIZATION_TARGET_KEYS,
+            exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            compute_device=torch.device(device), grad_mode=quant_int8)
+        dit.to(device)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info(f"INT8 W8A8 base active: {n_q} Linears; grad_mode={quant_int8}; resident on {device}.")
     if quant_4bit:
         from fizgig.krea2.utils import KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS
         from fizgig.modules.nf4 import apply_nf4_quantization
@@ -114,7 +135,144 @@ def load_dit_for_training(
     network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
     network.requires_grad_(True)
     network.to(device=device, dtype=dtype)
+
+    # torch.compile LAST — after the LoRA has patched the forwards, so the compiled graph is the
+    # one that actually runs. Per block, not whole-model: the 28 blocks share a graph signature so
+    # inductor compiles once and reuses, and a failure is contained to one block.
+    if compile_blocks:
+        _compile_blocks(dit, blocks_to_swap)
     return dit, network
+
+
+class _CheckpointedBlock(torch.nn.Module):
+    """A transformer block that does its own gradient checkpointing.
+
+    Exists so torch.compile can capture the checkpoint inside the graph. `_handles_checkpointing`
+    tells the DiT forward not to wrap it a second time.
+    """
+
+    _handles_checkpointing = True
+
+    def __init__(self, block, checkpointing: bool):
+        super().__init__()
+        self.block = block
+        self.checkpointing = checkpointing
+
+    def forward(self, x, vec, freqs, attn_params=None):
+        if self.checkpointing and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                self.block, x, vec, freqs, attn_params, use_reentrant=False)
+        return self.block(x, vec, freqs, attn_params)
+
+
+def _find_msvc_env() -> bool:
+    """Put MSVC on PATH for torch.compile, if it is installed but not in this shell.
+
+    On Windows, inductor generates C++ for the host-side wrapper around the Triton kernels and
+    needs `cl.exe` to build it. Visual Studio installs it but only exposes it inside a developer
+    prompt, so launching Fizgig normally leaves torch.compile dead on arrival with a traceback out
+    of `get_cpp_compiler`. Running vcvars64.bat and importing the environment it sets is what a
+    developer prompt does; doing it here means the user does not have to know any of this.
+    """
+    import shutil
+    import subprocess
+
+    if os.name != "nt" or shutil.which("cl"):
+        return True
+
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    roots = []
+    if os.path.isfile(vswhere):
+        try:
+            out = subprocess.run([vswhere, "-latest", "-products", "*", "-property", "installationPath"],
+                                 capture_output=True, text=True, timeout=30)
+            roots += [line.strip() for line in out.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+    for pf in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+               os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        for year in ("2022", "2019"):
+            for ed in ("BuildTools", "Community", "Professional", "Enterprise"):
+                roots.append(os.path.join(pf, "Microsoft Visual Studio", year, ed))
+
+    for root in roots:
+        vcvars = os.path.join(root, "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if not os.path.isfile(vcvars):
+            continue
+        try:
+            out = subprocess.run(f'"{vcvars}" >nul && set', shell=True, capture_output=True,
+                                 text=True, timeout=120)
+            if out.returncode != 0:
+                continue
+            for line in out.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ[k] = v
+            if shutil.which("cl"):
+                logger.info("[compile] MSVC found via %s", os.path.basename(root))
+                return True
+        except Exception:
+            continue
+
+    logger.warning("[compile] no MSVC C++ compiler found — torch.compile needs one on Windows to "
+                   "build inductor's host-side code. Direct installer: "
+                   "https://aka.ms/vs/17/release/vs_BuildTools.exe (tick the 'Desktop development "
+                   "with C++' workload), or leave Compile Blocks off. Training continues uncompiled.")
+    return False
+
+
+def _compile_blocks(dit, blocks_to_swap: int) -> None:
+    """Compile each transformer block. Opt-in — see the roadmap for what it is and isn't worth.
+
+    The win is real on the quantised path (inductor fuses the per-matmul quantise/dequantise
+    elementwise work that bounds INT8), and small on dense bf16. It costs compile time on the
+    first step, and a recompile for every new latent shape a bucketed dataset presents.
+
+    Refused under block swap: compiled graphs assume their weights stay put, and swap moves them
+    between CPU and GPU every step.
+    """
+    if blocks_to_swap > 0:
+        logger.warning("[compile] ignored — block swap moves weights between devices every step, "
+                       "which invalidates compiled graphs. Quantise instead of swapping if you "
+                       "want both.")
+        return
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        logger.warning("[compile] ignored — triton is not installed (pip install triton-windows "
+                       "on Windows, triton on Linux)")
+        return
+    if not _find_msvc_env():
+        return
+    import torch._dynamo
+    # Raises the recompile ceiling (default 8, which a bucketed dataset exhausts immediately —
+    # after which dynamo silently runs eager) and works around a torch assertion that otherwise
+    # aborts inductor mid-run. See fizgig/modules/compile_util.py.
+    from fizgig.modules.compile_util import init_compile
+    init_compile()
+    # Settle the SDPA backend global BEFORE tracing: its lazy first-use probe (device alloc +
+    # global write + logging) inside a compiled block is exactly what fullgraph=True raises on.
+    from fizgig.modules import sdpa as _sdpa
+    _sdpa.prime()
+    # A compile failure must cost speed, not the run.
+    torch._dynamo.config.suppress_errors = True
+
+    # fullgraph=True refuses to compile around a graph break instead of quietly degrading. The
+    # known break (attn_params.seqlens[0].item(), a device sync in the trim check) was fixed
+    # earlier, so this should now hold — and if it does not, it says so instead of hiding.
+    #
+    # Each block is wrapped so the GRADIENT CHECKPOINT sits INSIDE the compiled region. Compiling
+    # the raw block and checkpointing around it leaves the recompute outside the graph, and with
+    # checkpointing the forward runs twice per step, so the boundary is worth 1.19x on a real block
+    # (8.817 -> 7.428 ms/block-step).
+    checkpointing = bool(getattr(dit, "gradient_checkpointing", False))
+    n = 0
+    for i, block in enumerate(dit.blocks):
+        dit.blocks[i] = torch.compile(_CheckpointedBlock(block, checkpointing), fullgraph=True)
+        n += 1
+    logger.info("[compile] %d blocks compiled (fullgraph, checkpoint inside the graph, "
+                "cache_size_limit=8192) — the first step of each new shape pauses to compile", n)
 
 
 def _get_lin_function(x1, y1, x2, y2):
@@ -302,6 +460,50 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
     # normalize for noise level (the caller ignores it when logging is off).
     return loss, float(t.mean().item())
+
+
+
+class _BucketOrderSampler(torch.utils.data.Sampler):
+    """Yield indices grouped by latent shape, shuffled within and across groups.
+
+    Keeps an epoch random while making consecutive steps mostly share a shape, which is what
+    lets shape-sensitive kernels (cuDNN attention, cuBLAS heuristics, torch.compile's shape
+    cache) stay warm. Reshuffles every epoch so the order is never identical twice.
+    """
+
+    def __init__(self, dataset, seed: int = 42):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+        buckets = {}
+        for i in range(len(dataset)):
+            lat = dataset[i]["latents"]
+            buckets.setdefault(tuple(lat.shape[-2:]), []).append(i)
+        self.buckets = list(buckets.values())
+        self.n = sum(len(b) for b in self.buckets)
+        self.n_shapes = len(self.buckets)
+        # What a plain shuffle would cost, for the log line: probability consecutive draws
+        # differ, times the number of transitions.
+        p_same = sum((len(b) / self.n) ** 2 for b in self.buckets)
+        self.est_random_changes = int(round((1 - p_same) * (self.n - 1)))
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.n
+
+    def __iter__(self):
+        import random as _r
+        rng = _r.Random(self.seed + self.epoch)
+        order = []
+        groups = [list(b) for b in self.buckets]
+        for g in groups:
+            rng.shuffle(g)
+        rng.shuffle(groups)
+        for g in groups:
+            order.extend(g)
+        return iter(order)
 
 
 class _Krea2Collator:
@@ -603,6 +805,23 @@ def _read_sample_override(output_dir):
     return None
 
 
+def _remove_claimed_queue(path: str) -> None:
+    """Best-effort removal of the claimed caption queue (.processing).
+
+    The Problem Images window polls this exact file every 4 s and Python's open()
+    doesn't request FILE_SHARE_DELETE, so on Windows os.remove can raise
+    PermissionError while the GUI holds it open. That must never propagate out of
+    the epoch boundary — or (worse) trip the re-encode failure path AFTER a
+    successful encode, re-queueing captions that were already applied. The file
+    is consumed on the next boundary either way."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logger.debug("[caption-fix] could not remove %s (%s) — a reader holds it open; "
+                     "it will be cleaned up next boundary", os.path.basename(path), e)
+
+
 def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap, loss_watch, epoch,
                            *, auto_recaption=False, trigger_word=None, recaptioned=None,
                            image_dir=None, caption_ext=".txt"):
@@ -653,8 +872,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
                     break
 
     if not updates and not auto_todo:
-        if os.path.exists(processing):
-            os.remove(processing)
+        _remove_claimed_queue(processing)
         return
     if not te_path:
         logger.warning("[caption-fix] caption work is pending but no text encoder path was passed "
@@ -669,7 +887,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
                 with open(path + ".tmp", "w", encoding="utf-8") as f:
                     json.dump(merged, f, indent=2)
                 os.replace(path + ".tmp", path)
-                os.remove(processing)
+                _remove_claimed_queue(processing)
             except Exception:
                 pass
         return
@@ -691,8 +909,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
             logger.warning(f"[caption-fix] '{k}' not found in the training set — skipped")
     auto_todo = [(k, p, a) for k, p, a in auto_todo if k in items]
     if not todo and not auto_todo:
-        if os.path.exists(processing):
-            os.remove(processing)
+        _remove_claimed_queue(processing)
         return
 
     logger.info(f"[caption-fix] epoch boundary {epoch}: {len(todo)} manual edit(s), "
@@ -736,8 +953,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
 
         if not todo:
             del encoder
-            if os.path.exists(processing):
-                os.remove(processing)
+            _remove_claimed_queue(processing)
             return
         for _, item, cap, _auto in todo:
             item.caption = cap
@@ -761,22 +977,27 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
                 if attempt >= 2:
                     loss_watch.mark_incorrigible(k)
         # Ack for the GUI (row badge "caption re-encoded @ epoch N" / "AI re-captioned").
+        # Per-fix HISTORY list per key — last-writer-wins lost every fix but the final one,
+        # so an image fixed twice replayed only its last reset on resume and the pre-first-fix
+        # records (the old caption's, usually the worst in the run) skewed the thresholds
+        # every other image is judged against. Older files carry a single dict per key.
         applied_path = os.path.join(output_dir, "loss_log", "caption_updates_applied.json")
         applied = {}
         try:
             if os.path.exists(applied_path):
                 with open(applied_path, encoding="utf-8") as f:
-                    applied = json.load(f)
+                    applied = {k: (v if isinstance(v, list) else [v])
+                               for k, v in json.load(f).items()}
         except Exception:
             applied = {}
         for k, _, cap, attempt in todo:
-            applied[k] = {"epoch": epoch, "caption": cap, "auto": attempt > 0, "attempt": attempt}
+            applied.setdefault(k, []).append(
+                {"epoch": epoch, "caption": cap, "auto": attempt > 0, "attempt": attempt})
         # Atomic write — the GUI polls this file for the row badges.
         with open(applied_path + ".tmp", "w", encoding="utf-8") as f:
             json.dump(applied, f, indent=2)
         os.replace(applied_path + ".tmp", applied_path)
-        if os.path.exists(processing):
-            os.remove(processing)
+        _remove_claimed_queue(processing)
         logger.info(f"[caption-fix] {len(todo)} caption(s) re-encoded — next epoch trains on the "
                     f"fixed text. Loss-watch history reset for: "
                     + ", ".join(os.path.basename(k) for k, _, _, _ in todo))
@@ -795,32 +1016,31 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
             with open(path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(merged, f, indent=2)
             os.replace(path + ".tmp", path)
-            if os.path.exists(processing):
-                os.remove(processing)
+            _remove_claimed_queue(processing)
         except Exception:
             pass
     finally:
+        # Restore the training DiT's placement exactly as load_dit_for_training left it.
+        # (A garbled duplicate of this block previously ran `dit.to(device)` on every
+        # non-NF4 run, hoisting all 28 blocks onto the GPU and undoing the block-swap
+        # placement two lines above it — OOM on small cards at the next step.)
         gc.collect()
         torch.cuda.empty_cache()
-        if blocks_to_swap > 0:
+        if getattr(dit, "_nf4_quantized", False):
+            from fizgig.modules.nf4 import move_nf4_to_device
+            move_nf4_to_device(dit, device)
+        elif blocks_to_swap > 0:
             dit.move_to_device_except_swap_blocks(torch.device(device))
             dit.switch_block_swap_for_training()
         else:
             dit.to(device)
-        if getattr(dit, "_nf4_quantized", False):
-            from fizgig.modules.nf4 import move_nf4_to_device
-            move_nf4_to_device(dit, device)
-        else:
-            dit.to(device)
-        if getattr(dit, "_nf4_quantized", False):
-            from fizgig.modules.nf4 import move_nf4_to_device
-            move_nf4_to_device(dit, device)
         dit.train()
     return ok
 
 
 def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
-                    output_name="krea2", steps=8, cfg_scale=1.0, width=512, height=512,
+                    output_name="krea2", steps=8, cfg_scale=1.0, neg=None,
+                    width=512, height=512,
                     seed=42, context_lora_path=None, context_lora_strength=1.0,
                     blocks_to_swap=0, int8=False, device="cuda"):
     """Load the (clean) pre-quant fp8 Turbo, apply the current LoRA LIVE (no merge -> no grid),
@@ -875,9 +1095,13 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")  # 14-digit timestamp
     paths = []
+    # Negative prompt rides through the CFG path (untxt) — only when CFG is actually on.
+    _untxt = _untxtmask = None
+    if neg is not None and cfg_scale and cfg_scale > 1.0:
+        _untxt, _untxtmask = neg
     for i, (txt, txtmask) in enumerate(encoded_prompts):
         with torch.no_grad():
-            imgs = sampling.sample(turbo, ae, txt, txtmask, untxt=None, untxtmask=None,
+            imgs = sampling.sample(turbo, ae, txt, txtmask, untxt=_untxt, untxtmask=_untxtmask,
                                    device=device, dtype=torch.bfloat16, width=width, height=height,
                                    steps=steps, cfg_scale=cfg_scale, mu=1.15, seed=seed + i)
         p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
@@ -901,6 +1125,7 @@ def train_krea2(
     save_every_n_epochs: int = 0,
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
+    quant_int8: str = "",
     blocks_to_swap: int = 0,
     shift: float = 2.5,
     max_grad_norm: float = 1.0,
@@ -908,6 +1133,10 @@ def train_krea2(
     # Effective batch = batch_size (1) x this. Grads accumulate over N micro-batches, then one
     # optimizer step. Per-image LR still applies per micro-batch (each image scales its own loss).
     gradient_accumulation_steps: int = 1,
+    # Optimizer family + free-form kwargs ("weight_decay=0.01 betas=0.9,0.99").
+    optimizer_type: str = "adamw8bit",
+    optimizer_args: str = "",
+    compile_blocks: str = "auto",   # "auto" | "on" | "off"
     # LR schedule (step-level). Ignored when adaptive_lr is on — that watcher owns the LR.
     lr_scheduler: str = "constant",
     lr_warmup_steps: int = 0,
@@ -923,6 +1152,9 @@ def train_krea2(
     sample_width: int = 512,
     sample_height: int = 512,
     sample_steps: int = 8,
+    sample_cfg_scale: float = 1.0,   # >1 enables CFG on the Turbo (needs sample_negative for a real uncond)
+    sample_negative: str = None,     # negative prompt, used only when sample_cfg_scale > 1
+    sample_at_first: bool = False,   # render an epoch-0 preview before training starts
     sample_seed: int = 42,
     sample_ref_image: str = None,
     preview_blocks_to_swap: int = 0,
@@ -938,6 +1170,12 @@ def train_krea2(
     adaptive_lr: bool = False,
     adaptive_lr_min: float = 1e-5,
     adaptive_lr_max: float = 4e-4,
+    # Output metadata (Other Options → Metadata in the GUI) — recorded in the saved LoRA.
+    metadata_title: str = None,
+    metadata_author: str = None,
+    metadata_description: str = None,
+    metadata_license: str = None,
+    metadata_tags: str = None,
     # Perceptual auxiliary losses (depth / identity / landmark / body-proportion — same four
     # phases and flag names as Klein's src/fizgig/training/trainer.py). All 0.0 = disabled.
     depth_loss_weight: float = 0.0,
@@ -973,6 +1211,33 @@ def train_krea2(
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
+
+    # Resolve quantisation/swap interactions BEFORE anything reads blocks_to_swap —
+    # should_compile used to be consulted with a swap value the NF4 branch zeroed a few
+    # lines later, declining compile "because block swap is active" about a swap that no
+    # longer existed (NF4 + compile is the one combination measured VRAM-neutral).
+    if quant_4bit and blocks_to_swap > 0:
+        logger.info("[nf4] 4-bit base is incompatible with block swap (weights live in _nf4_packed) "
+                    "— forcing blocks_to_swap=0.")
+        blocks_to_swap = 0
+    if quant_int8 and blocks_to_swap > 0:
+        # The int8 path stages on CPU then makes the whole quantised model resident —
+        # swap could never engage before the full residency, so it OOM'd at load on
+        # exactly the cards that asked for swapping. INT8 residency is ~its own budget;
+        # cards that need swap should use fp8+swap or NF4 instead.
+        logger.info("[int8] W8A8 base is fully resident (staged quantise -> GPU) — block swap "
+                    "can't reduce its footprint; forcing blocks_to_swap=0.")
+        blocks_to_swap = 0
+
+    # torch.compile: "auto" weighs its ~90 s warm-up against how long this run actually is, which
+    # is knowable here because the dataset is already built. Short runs are a straight loss, so the
+    # default must not simply turn it on. "on"/"off" are the explicit overrides.
+    _do_compile = str(compile_blocks).lower() in ("1", "true", "on", "yes")
+    if str(compile_blocks).lower() == "auto":
+        from fizgig.utils.capabilities import should_compile
+        _steps_est = group.num_train_items * max_train_epochs
+        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap)
+        logger.info("[compile] auto: %s — %s", "ENABLED" if _do_compile else "off", _why)
 
     # ------------------------------------------------------------------
     # Perceptual auxiliary losses — cache pass + encoder setup
@@ -1110,26 +1375,32 @@ def train_krea2(
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.
-    do_previews = bool(sample_every_n_epochs and sample_prompts and turbo_path and vae_path and te_path)
+    # sample_at_first counts as wanting previews even without a per-epoch cadence.
+    do_previews = bool((sample_every_n_epochs or sample_at_first)
+                       and sample_prompts and turbo_path and vae_path and te_path)
     encoded_prompts = sample_ae = sample_dir = None
+    encoded_negative = None
     if do_previews:
         from fizgig.krea2.vae_loader import load_vae
         logger.info(f"pre-encoding {len(sample_prompts)} sample prompt(s)"
                     f"{' with reference image' if sample_ref_image else ''}...")
         encoded_prompts = encode_sample_prompts(te_path, sample_prompts, ref_image=sample_ref_image, device=device)
+        if sample_negative and sample_cfg_scale and sample_cfg_scale > 1.0:
+            # One shared negative embedding; only meaningful with CFG active.
+            encoded_negative = encode_sample_prompts(te_path, [sample_negative], device=device)[0]
+        elif sample_negative:
+            logger.info("[sample] negative prompt set but CFG Scale is 1.0 (CFG off) — it will "
+                        "be ignored. Set Sample CFG Scale above 1 to use it.")
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
-    if quant_4bit and blocks_to_swap > 0:
-        logger.info("[nf4] 4-bit base is incompatible with block swap (weights live in _nf4_packed) "
-                    "— forcing blocks_to_swap=0.")
-        blocks_to_swap = 0
     dit, network = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
-        fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, blocks_to_swap=blocks_to_swap,
+        fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
+        blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
         device=device, dtype=dtype)
-    if blocks_to_swap > 0 and not quant_4bit:
+    if blocks_to_swap > 0 and not quant_4bit and not quant_int8:
         from fizgig.krea2.offloading import BlockSwapConfig
         dit.enable_block_swap(blocks_to_swap, BlockSwapConfig(torch.device(device), supports_backward=True))
         dit.move_to_device_except_swap_blocks(torch.device(device))
@@ -1139,28 +1410,52 @@ def train_krea2(
     network.requires_grad_(True)
 
     params = list(network.get_trainable_params())
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(params, lr=learning_rate)
-        logger.info("optimizer: AdamW8bit")
-    except Exception:
-        optimizer = torch.optim.AdamW(params, lr=learning_rate)
-        logger.info("optimizer: AdamW (bitsandbytes unavailable)")
+    from fizgig.training.optimizers import create_optimizer
+    optimizer, optimizer_label = create_optimizer(
+        optimizer_type, params, learning_rate, optimizer_args)
 
     collator = _Krea2Collator(shared_epoch, group)
-    loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
+    # Bucket-grouped ordering (OFF by default — measured, and it buys nothing today).
+    #
+    # OneTrainer groups batches by resolution (AspectBatchSorting); Fizgig shuffles freely,
+    # which changes latent shape on ~43% of steps for a mixed-aspect dataset. That sounded
+    # like it should matter — shape churn makes cuDNN re-plan, cuBLAS re-pick algorithms and
+    # the allocator fragment. Measured on a 36-image set, 3 epochs, NF4:
+    #
+    #     shuffled ................ 0.7042 s/it
+    #     bucket-grouped .......... 0.7042 s/it   (no change at all)
+    #     bucket-grouped + cuDNN .. 1.29   s/it   (vs 1.57 unbucketed — helps, still 1.8x worse)
+    #
+    # So the default backend does not care, and it is not enough to rescue cuDNN either. Left
+    # in because it should matter for torch.compile, which recompiles per shape — but not
+    # enabled without evidence, since grouping correlates consecutive gradients (all one aspect
+    # in a row), and that is a real if modest quality risk to take for nothing.
+    _sampler = None
+    if os.environ.get("FIZGIG_BUCKET_ORDER", "0") != "0":
+        try:
+            _sampler = _BucketOrderSampler(group, seed=seed)
+            logger.info("[dataloader] bucket-grouped order: %d shapes, ~%d shape changes/epoch "
+                        "(random shuffle would be ~%d)", _sampler.n_shapes,
+                        _sampler.n_shapes, _sampler.est_random_changes)
+        except Exception as e:
+            logger.warning("[dataloader] bucket ordering unavailable (%s) — using plain shuffle", e)
+    loader = DataLoader(group, batch_size=1, shuffle=(_sampler is None), sampler=_sampler,
+                        collate_fn=collator, num_workers=0)
 
     os.makedirs(output_dir, exist_ok=True)
     adaptive = AdaptiveLR(adaptive_lr_min, adaptive_lr_max) if adaptive_lr else None
     if adaptive:
-        # The Min LR floor is authoritative over the LR box: starting below the declared floor is
-        # contradictory, so the start is clamped UP to the floor (matches Klein).
-        if learning_rate < adaptive_lr_min:
-            logger.info(f"[adaptive_lr] starting LR {learning_rate:.3e} is below the Min LR floor — "
-                        f"raising start to {adaptive_lr_min:.3e} (the floor overrides the LR box)")
-            learning_rate = adaptive_lr_min
-            for g in optimizer.param_groups:
-                g["lr"] = adaptive_lr_min
+        # The Learning Rate box is IGNORED while adaptive is on: start at the GEOMETRIC
+        # MIDPOINT of Min/Max and let the watcher own the LR (matches Klein). Two knobs,
+        # not three. A resumed run's optimizer restore below overwrites this with the
+        # watcher's mid-flight LR, which is correct.
+        _mid = math.sqrt(adaptive_lr_min * adaptive_lr_max)
+        if abs(learning_rate - _mid) > 1e-12:
+            logger.info(f"[adaptive_lr] starting LR set to {_mid:.3e} — the geometric midpoint "
+                        f"of Min/Max (the Learning Rate box is ignored while adaptive is on)")
+        learning_rate = _mid
+        for g in optimizer.param_groups:
+            g["lr"] = _mid
         logger.info(f"[adaptive_lr] ENABLED — start_lr={learning_rate:.3e} "
                     f"min_lr={adaptive_lr_min:.3e} max_lr={adaptive_lr_max:.3e}")
 
@@ -1215,7 +1510,15 @@ def train_krea2(
         # where global_step calls to step() would have.
         if global_step > 0:
             # global_step counts micro-batches; the schedule's position is optimizer steps.
-            done_updates = global_step // accum
+            # The loop flushes a PARTIAL accumulation group at every epoch boundary (the
+            # scheduler steps there too), so updates/epoch = ceil(steps_per_epoch/accum) —
+            # a flat `global_step // accum` ignored those flushes and restored the schedule
+            # early, leaving the LR high for the whole remainder. Resume always lands on an
+            # epoch boundary; the leftover term covers a hand-rolled mid-epoch state anyway.
+            _epochs_done = global_step // steps_per_epoch
+            _leftover = global_step % steps_per_epoch
+            done_updates = (_epochs_done * math.ceil(steps_per_epoch / accum)
+                            + _leftover // accum)
             scheduler.last_epoch = done_updates - 1
             scheduler.step()
         logger.info(f"[lr_scheduler] {lr_scheduler} — warmup {int(lr_warmup_steps or 0)} / "
@@ -1292,8 +1595,13 @@ def train_krea2(
             auto_recaption = False
     loss_watch = None
     if watch_enabled:
+        # write_jsonl is ALWAYS on when the watch runs: the JSONL is the watch's persistence
+        # layer, not a detection feature. Binding it to the detect toggle meant per-image LR
+        # or auto-recaption without "Detect problem images" wrote no JSONL — and every resume
+        # of such a run silently discarded the entire watch history while `recaptioned` WAS
+        # restored from the ledger, pinning spent images on the stuck ladder with no way off.
         loss_watch = PerImageLossWatch(output_dir, apply_lr=per_image_lr,
-                                       write_jsonl=log_per_image_loss,
+                                       write_jsonl=True,
                                        dataset_dir=ar_image_dir, caption_ext=ar_caption_ext)
         # Reconcile persisted exclusions against the actual training set (prune entries for
         # images that left the dataset; refuse a file that would exclude everything).
@@ -1357,20 +1665,76 @@ def train_krea2(
                 with open(os.path.join(output_dir, "loss_log", "caption_updates_applied.json"),
                           encoding="utf-8") as _f:
                     for _k, _info in json.load(_f).items():
-                        _att = int(_info.get("attempt", 0) or 0)
-                        _auto = bool(_info.get("auto"))
-                        if _auto:
-                            recaptioned[_k] = max(recaptioned.get(_k, 0), _att)
-                        _resets[_k] = (int(_info.get("epoch", 0) or 0), _att, _auto)
+                        # Per-fix history list (older files: a single dict = last fix only).
+                        _entries = _info if isinstance(_info, list) else [_info]
+                        for _e in _entries:
+                            _att = int(_e.get("attempt", 0) or 0)
+                            _auto = bool(_e.get("auto"))
+                            if _auto:
+                                recaptioned[_k] = max(recaptioned.get(_k, 0), _att)
+                            _resets.setdefault(_k, []).append(
+                                (int(_e.get("epoch", 0) or 0), _att, _auto))
             except Exception:
                 pass
             loss_watch.resume_from_jsonl(up_to_epoch=start_epoch, resets=_resets)
+    # Sample at Start: an epoch-0 preview (base model + zero-init LoRA) so the run's
+    # starting point is on record. Fresh runs only — a resume already has samples.
+    if sample_at_first and do_previews and start_epoch == 0:
+        from safetensors.torch import load_file as _lf0
+        _tmp0 = os.path.join(output_dir, "_sample_lora.safetensors")
+        _save_lora(network, _tmp0, network_dim, network_alpha, dtype)
+        logger.info("rendering epoch-0 preview (Sample at Start)...")
+        dit.to("cpu")
+        if getattr(dit, "_nf4_quantized", False):
+            from fizgig.modules.nf4 import move_nf4_to_device
+            move_nf4_to_device(dit, "cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            _seed0 = sample_seed if sample_seed != 0 else random.randint(1, 2**31 - 1)
+            sample_previews(turbo_path, sample_ae, encoded_prompts, _lf0(_tmp0), sample_dir, 0,
+                            output_name=output_name, steps=sample_steps,
+                            cfg_scale=sample_cfg_scale, neg=encoded_negative,
+                            width=sample_width, height=sample_height, seed=_seed0,
+                            context_lora_path=context_lora_path,
+                            context_lora_strength=context_lora_strength,
+                            blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device)
+        except Exception as _e0:
+            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                           f"continues; per-epoch previews will still be attempted.")
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+            if getattr(dit, "_nf4_quantized", False):
+                from fizgig.modules.nf4 import move_nf4_to_device
+                move_nf4_to_device(dit, device)
+            elif blocks_to_swap > 0:
+                dit.move_to_device_except_swap_blocks(torch.device(device))
+                dit.switch_block_swap_for_training()
+            else:
+                dit.to(device)
+            dit.train()
+
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="steps", smoothing=0)
     pending_accum = 0  # micro-batches backward'd since the last optimizer step
+    # Warm-up reassurance: the first two epochs start slowly (first-sight kernel planning,
+    # cuBLAS algorithm picks, allocator + cache warm-up; the cuDNN switch at the epoch-1
+    # boundary re-plans every shape in epoch 2). Users watching a crawling bar assume a
+    # hang, so repeat a gentle note every ~30 s while it lasts.
+    _warmup_note_last = 0.0
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
+        if _sampler is not None:
+            _sampler.set_epoch(epoch)      # reshuffle within/across buckets each epoch
         for i, batch in enumerate(loader):
+            if epoch < 2:
+                _now = time.time()
+                if _now - _warmup_note_last > 30.0:
+                    _warmup_note_last = _now
+                    logger.info("[warm-up] Warm-up phase — the first two epochs start slowly "
+                                "while the GPU plans kernels and fills its caches. Nothing is "
+                                "stuck; full speed arrives from epoch 3.")
             # Excluded images (two failed AI recaptions, still stuck) are skipped ENTIRELY: no
             # forward, no gradient, and no loss recorded — avr_loss stops carrying their permanent
             # error term. Step accounting (bar + global_step) stays consistent for resume math.
@@ -1423,6 +1787,23 @@ def train_krea2(
         logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
                     + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if scheduler is not None else ""))
 
+        # Attention backend: cuDNN's kernel is ~6% faster per step but costs ~1.3 s per distinct
+        # sequence shape to plan, so it only wins on runs long enough to amortize that. After a
+        # full epoch every shape the dataset produces has been seen, so this is arithmetic rather
+        # than a guess — see fizgig/modules/sdpa.py.
+        # SUPPRESSED under torch.compile: flipping the backend mid-run changes the branch every
+        # compiled block traced, forcing a retrace whose worst case (fullgraph + an unprimed
+        # path) killed the run at the epoch-2 boundary. Compile's own win is the larger one;
+        # take cuDNN only on uncompiled runs.
+        _switch = None if _do_compile else \
+            _consider_training_backend(steps_per_epoch * (max_train_epochs - epoch - 1))
+        if _switch:
+            _n_shapes, _needed = _switch
+            logger.info(f"[attention] switching to the cuDNN backend for the rest of the run — "
+                        f"{_n_shapes} distinct sequence shape(s), which pays back within "
+                        f"{_needed} steps and this run has more left. Expect a slower first pass "
+                        f"over each shape while it plans, then ~6% faster steps.")
+
         # Adaptive LR: epoch-boundary plateau tracker (before save/preview so they reflect the
         # post-adjustment state). Uses the smoothed avr_loss as the signal, like Klein.
         if adaptive:
@@ -1446,7 +1827,7 @@ def train_krea2(
             _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
                        network_dim, network_alpha, dtype)
 
-        if do_previews and (epoch + 1) % sample_every_n_epochs == 0:
+        if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
             from safetensors.torch import load_file
             tmp = os.path.join(output_dir, "_sample_lora.safetensors")
             _save_lora(network, tmp, network_dim, network_alpha, dtype)
@@ -1484,7 +1865,8 @@ def train_krea2(
                     prev_seed = random.randint(1, 2**31 - 1)
                     logger.info(f"[sample] seed 0 -> random {prev_seed}")
                 sample_previews(turbo_path, sample_ae, prev_enc, load_file(tmp), sample_dir, epoch + 1,
-                                output_name=output_name, steps=sample_steps, width=prev_w,
+                                output_name=output_name, steps=sample_steps,
+                                cfg_scale=sample_cfg_scale, neg=encoded_negative, width=prev_w,
                                 height=prev_h, seed=prev_seed,
                                 context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
                                 blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device)
@@ -1541,10 +1923,16 @@ def train_krea2(
     out = os.path.join(output_dir, f"{output_name}.safetensors")
     # Record the context LoRA in metadata so users know to pair it at the same strength at
     # inference (the trained LoRA is context-dependent — same contract as Klein).
-    extra = None
+    extra = {"ss_optimizer": optimizer_label}
     if context_lora_path:
-        extra = {"ss_context_lora": os.path.basename(context_lora_path),
-                 "ss_context_lora_strength": str(context_lora_strength)}
+        extra.update({"ss_context_lora": os.path.basename(context_lora_path),
+                      "ss_context_lora_strength": str(context_lora_strength)})
+    # User metadata (GUI: Other Options → Metadata) — same keys ComfyUI/model managers read.
+    for _mk, _mv in (("modelspec.title", metadata_title), ("modelspec.author", metadata_author),
+                     ("modelspec.description", metadata_description),
+                     ("modelspec.license", metadata_license), ("modelspec.tags", metadata_tags)):
+        if _mv:
+            extra[_mk] = str(_mv)
     _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra)
     logger.info(f"saved final LoRA -> {out}")
     return out
