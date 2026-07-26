@@ -2754,9 +2754,26 @@ class KleinTrainer:
                                 and _t_ratio <= args.body_proportion_loss_max_t
                             )
                             if _in_t_range:
-                                _gt_bp = batch['body_proportion_embedding'].to(accelerator.device)
-                                _live_bp = _body_prop_encoder(_x0_pixels)
-                                _bp_loss = torch.nn.functional.l1_loss(_live_bp, _gt_bp.float())
+                                _gt_bp = batch['body_proportion_embedding'].to(accelerator.device).float()
+                                # Cached embedding is (B, 2N): ratios then per-ratio visibility.
+                                _bp_n = _gt_bp.shape[-1] // 2
+                                _ref_ratios, _ref_vis = _gt_bp[:, :_bp_n], _gt_bp[:, _bp_n:]
+                                _gen_ratios, _gen_vis = _body_prop_encoder(_x0_pixels)
+                                # Visibility-weighted L1 + a missing-keypoint penalty (ai-toolkit-perceptual's
+                                # SDTrainer._need_body_proportion_loss): a ratio only counts if BOTH the
+                                # cached GT and the live prediction trust it (elementwise min), and a ratio
+                                # the GT was confident about but the live prediction lost visibility on adds
+                                # a separate penalty (not just zero weight) so the model can't dodge the loss
+                                # by simply losing track of a limb.
+                                _combined_vis = torch.min(_ref_vis, _gen_vis)
+                                _weighted_diff = (_gen_ratios - _ref_ratios).abs() * _combined_vis
+                                _bp_loss_per_sample = (
+                                    _weighted_diff.sum(dim=-1) / _combined_vis.sum(dim=-1).clamp(min=1e-6)
+                                )
+                                _missing_mask = (_ref_vis >= 0.5) & (_gen_vis < 0.2)
+                                _ref_high_count = (_ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                                _visibility_penalty = _missing_mask.float().sum(dim=-1) / _ref_high_count
+                                _bp_loss = (_bp_loss_per_sample + _visibility_penalty).mean()
                                 loss = loss + args.body_proportion_loss_weight * _bp_loss
 
                     # Backward

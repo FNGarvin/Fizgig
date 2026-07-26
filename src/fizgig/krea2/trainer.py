@@ -281,9 +281,22 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
         # --- ViTPose body proportion loss ---
         if perceptual.body_prop_encoder is not None and 'body_proportion_embedding' in batch:
             if pa.body_proportion_loss_min_t <= _t_ratio <= pa.body_proportion_loss_max_t:
-                _gt_bp = batch['body_proportion_embedding'].to(device)
-                _live_bp = perceptual.body_prop_encoder(x0_pixels)
-                _bp_loss = F.l1_loss(_live_bp, _gt_bp.float())
+                _gt_bp = batch['body_proportion_embedding'].to(device).float()
+                # Cached embedding is (B, 2N): ratios then per-ratio visibility (see Klein's
+                # trainer.py for the full explanation of this visibility-weighted formula, ported
+                # from ai-toolkit-perceptual's SDTrainer._need_body_proportion_loss).
+                _bp_n = _gt_bp.shape[-1] // 2
+                _ref_ratios, _ref_vis = _gt_bp[:, :_bp_n], _gt_bp[:, _bp_n:]
+                _gen_ratios, _gen_vis = perceptual.body_prop_encoder(x0_pixels)
+                _combined_vis = torch.min(_ref_vis, _gen_vis)
+                _weighted_diff = (_gen_ratios - _ref_ratios).abs() * _combined_vis
+                _bp_loss_per_sample = (
+                    _weighted_diff.sum(dim=-1) / _combined_vis.sum(dim=-1).clamp(min=1e-6)
+                )
+                _missing_mask = (_ref_vis >= 0.5) & (_gen_vis < 0.2)
+                _ref_high_count = (_ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                _visibility_penalty = _missing_mask.float().sum(dim=-1) / _ref_high_count
+                _bp_loss = (_bp_loss_per_sample + _visibility_penalty).mean()
                 loss = loss + pa.body_proportion_loss_weight * _bp_loss
 
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
