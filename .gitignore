@@ -50,6 +50,7 @@ profiles/*
 # Research (private)
 research/
 anchor_images/
+docs/PERCEPTUAL_LORA_NOTES.md
 
 # IDE
 .vscode/
